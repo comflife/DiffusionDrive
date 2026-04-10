@@ -113,18 +113,14 @@ class TransfuserAgentAR(AbstractAgent):
         return self.__class__.__name__
 
     def initialize(self) -> None:
-        """Inherited, see superclass."""
-        if self._checkpoint_path:
-            if torch.cuda.is_available():
-                state_dict: Dict[str, Any] = torch.load(self._checkpoint_path)["state_dict"]
-            else:
-                state_dict: Dict[str, Any] = torch.load(
-                    self._checkpoint_path, map_location=torch.device("cpu")
-                )["state_dict"]
-            self.load_state_dict(
-                {k.replace("agent.", ""): v for k, v in state_dict.items()},
-                strict=False  # Non-strict for AR head
-            )
+        """Inherited, see superclass.
+        
+        For evaluation, load the full trained model (backbone + AR head).
+        This is called after __init__, so we skip if already loaded in init_from_pretrained.
+        """
+        # Checkpoint loading is handled in init_from_pretrained() during __init__
+        # This method is kept for compatibility with AbstractAgent interface
+        pass
 
     def get_sensor_config(self) -> SensorConfig:
         """Inherited, see superclass."""
@@ -254,4 +250,16 @@ class TransfuserAgentAR(AbstractAgent):
 
     def get_training_callbacks(self) -> List[pl.Callback]:
         """Inherited, see superclass."""
-        return [TransfuserCallback(self._config)]
+        from pytorch_lightning.callbacks import ModelCheckpoint
+        
+        checkpoint_callback = ModelCheckpoint(
+            dirpath=None,  # Uses default_root_dir from Trainer
+            filename='{epoch:02d}-{val_loss:.2f}',
+            save_top_k=3,
+            monitor='val/loss',
+            mode='min',
+            save_last=True,
+            every_n_epochs=1,
+        )
+        
+        return [TransfuserCallback(self._config), checkpoint_callback]

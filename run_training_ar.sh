@@ -29,7 +29,7 @@ python -m navsim.planning.script.run_training \
     trainer.params.max_epochs=100 \
     +trainer.params.devices=4 \
     trainer.params.strategy=ddp_find_unused_parameters_true \
-    dataloader.params.batch_size=8 \
+    dataloader.params.batch_size=32 \
     agent.lr=2e-4 \
     output_dir=/data2/byounggun/diffusiondrive_ar_output \
     wandb.enabled=true \

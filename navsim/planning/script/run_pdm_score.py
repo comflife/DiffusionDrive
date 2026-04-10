@@ -110,32 +110,53 @@ def main(cfg: DictConfig) -> None:
     build_logger(cfg)
     worker = build_worker(cfg)
 
-    # Extract scenes based on scene-loader to know which tokens to distribute across workers
-    # TODO: infer the tokens per log from metadata, to not have to load metric cache and scenes here
-    scene_loader = SceneLoader(
-        sensor_blobs_path=None,
-        data_path=Path(cfg.navsim_log_path),
-        scene_filter=instantiate(cfg.train_test_split.scene_filter),
-        sensor_config=SensorConfig.build_no_sensors(),
-    )
     metric_cache_loader = MetricCacheLoader(Path(cfg.metric_cache_path))
-
-    tokens_to_evaluate = list(set(scene_loader.tokens) & set(metric_cache_loader.tokens))
-    num_missing_metric_cache_tokens = len(set(scene_loader.tokens) - set(metric_cache_loader.tokens))
-    num_unused_metric_cache_tokens = len(set(metric_cache_loader.tokens) - set(scene_loader.tokens))
-    if num_missing_metric_cache_tokens > 0:
-        logger.warning(f"Missing metric cache for {num_missing_metric_cache_tokens} tokens. Skipping these tokens.")
-    if num_unused_metric_cache_tokens > 0:
-        logger.warning(f"Unused metric cache for {num_unused_metric_cache_tokens} tokens. Skipping these tokens.")
-    logger.info("Starting pdm scoring of %s scenarios...", str(len(tokens_to_evaluate)))
-    data_points = [
-        {
-            "cfg": cfg,
-            "log_file": log_file,
-            "tokens": tokens_list,
-        }
-        for log_file, tokens_list in scene_loader.get_tokens_list_per_log().items()
-    ]
+    
+    # Check if we should skip SceneLoader and use metric cache only
+    if cfg.get("use_cache_without_dataset", False):
+        logger.info("Using metric cache without SceneLoader (fast mode)")
+        tokens_to_evaluate = metric_cache_loader.tokens
+        logger.info(f"Found {len(tokens_to_evaluate)} tokens in metric cache")
+        # Group tokens by log file (extract log name from token path)
+        tokens_per_log = {}
+        for token in tokens_to_evaluate:
+            # Token format: log_file_token_id, extract log_file
+            parts = token.rsplit("_", 1)
+            if len(parts) == 2:
+                log_file = parts[0]
+            else:
+                log_file = "unknown"
+            if log_file not in tokens_per_log:
+                tokens_per_log[log_file] = []
+            tokens_per_log[log_file].append(token)
+        data_points = [
+            {"cfg": cfg, "log_file": log_file, "tokens": tokens}
+            for log_file, tokens in tokens_per_log.items()
+        ]
+    else:
+        # Original behavior: use SceneLoader
+        scene_loader = SceneLoader(
+            sensor_blobs_path=None,
+            data_path=Path(cfg.navsim_log_path),
+            scene_filter=instantiate(cfg.train_test_split.scene_filter),
+            sensor_config=SensorConfig.build_no_sensors(),
+        )
+        tokens_to_evaluate = list(set(scene_loader.tokens) & set(metric_cache_loader.tokens))
+        num_missing_metric_cache_tokens = len(set(scene_loader.tokens) - set(metric_cache_loader.tokens))
+        num_unused_metric_cache_tokens = len(set(metric_cache_loader.tokens) - set(scene_loader.tokens))
+        if num_missing_metric_cache_tokens > 0:
+            logger.warning(f"Missing metric cache for {num_missing_metric_cache_tokens} tokens. Skipping these tokens.")
+        if num_unused_metric_cache_tokens > 0:
+            logger.warning(f"Unused metric cache for {num_unused_metric_cache_tokens} tokens. Skipping these tokens.")
+        logger.info("Starting pdm scoring of %s scenarios...", str(len(tokens_to_evaluate)))
+        data_points = [
+            {
+                "cfg": cfg,
+                "log_file": log_file,
+                "tokens": tokens_list,
+            }
+            for log_file, tokens_list in scene_loader.get_tokens_list_per_log().items()
+        ]
     score_rows: List[Tuple[Dict[str, Any], int, int]] = worker_map(worker, run_pdm_score, data_points)
 
     pdm_score_df = pd.DataFrame(score_rows)

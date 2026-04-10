@@ -16,3 +16,4 @@ defaults:
   - override train_test_split: navtest
 
 metric_cache_path: ${oc.env:NAVSIM_EXP_ROOT}/metric_cache # path to metric cache
+use_cache_without_dataset: false # If true, skip SceneLoader and use metric cache tokens directly
