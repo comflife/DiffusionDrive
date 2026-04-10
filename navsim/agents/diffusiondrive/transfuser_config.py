@@ -16,7 +16,7 @@ class TransfuserConfig:
     image_architecture: str = "resnet34"
     lidar_architecture: str = "resnet34"
     bkb_path: str = "/home/users/bencheng.liao/.cache/huggingface/hub/checkpoints/resnet34.a1_in1k/pytorch_model.bin"
-    plan_anchor_path: str = "/home/users/bencheng.liao/PlanWrapper/playground/visualization/kmeans_navsim_traj_20.npy"
+    plan_anchor_path: str = "/data/navsim/dataset/checkpoints/kmeans_navsim_traj_20.npy"
 
     latent: bool = False
     latent_rad_thresh: float = 4 * np.pi / 9
@@ -128,6 +128,12 @@ class TransfuserConfig:
             }
         }
     }
+    
+    # Discrete AR specific configurations (for DiffusionDrive-AR)
+    ego_vocab_size: int = 512  # Ego trajectory vocabulary size
+    ego_vocab_path: str = ""   # Path to ego codebook .npy file
+    agent_topk: int = 8        # Number of top agents to use as context
+    agent_context_dim: int = 256  # Dimension for agent continuous feature encoding
     # optimizer=dict(
     #     type="AdamW",
     #     lr=1e-4,

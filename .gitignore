@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Jupyter
+.ipynb_checkpoints
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Model weights
+*.pth
+*.pt
+*.ckpt
+
+# Data
+codebook_cache/
+*.npy
+!kmeans_navsim_traj_20.npy
+
+# Logs
+diffusiondrive_navsim_88p1_PDMS
+*.log
+
