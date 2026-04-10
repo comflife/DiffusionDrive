@@ -49,3 +49,12 @@ trainer:
     gradient_clip_val: 0.0  # value to clip gradients
     gradient_clip_algorithm: norm  # [value, norm] method to clip gradients
     default_root_dir: ${output_dir}
+
+# Wandb logger configuration
+wandb:
+  enabled: true  # set to false to disable wandb logging
+  project: "diffusiondrive-ar"  # wandb project name
+  name: null  # run name (null = auto-generated)
+  entity: null  # wandb entity (username or team)
+  tags: []  # list of tags
+  notes: null  # run notes

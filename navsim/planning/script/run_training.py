@@ -1,4 +1,4 @@
-from typing import Tuple
+from typing import Tuple, List, Optional
 from pathlib import Path
 import logging
 
@@ -7,6 +7,7 @@ from hydra.utils import instantiate
 from omegaconf import DictConfig
 from torch.utils.data import DataLoader
 import pytorch_lightning as pl
+from pytorch_lightning.loggers import WandbLogger
 
 from navsim.agents.abstract_agent import AbstractAgent
 from navsim.common.dataclasses import SceneFilter
@@ -128,7 +129,26 @@ def main(cfg: DictConfig) -> None:
     logger.info("Num validation samples: %d", len(val_data))
 
     logger.info("Building Trainer")
-    trainer = pl.Trainer(**cfg.trainer.params, callbacks=agent.get_training_callbacks())
+    
+    # Setup wandb logger if enabled
+    loggers: List[Optional[pl.loggers.Logger]] = []
+    if cfg.wandb.get("enabled", False):
+        logger.info(f"Initializing WandbLogger (project: {cfg.wandb.project})")
+        wandb_logger = WandbLogger(
+            project=cfg.wandb.project,
+            name=cfg.wandb.get("name", None),
+            entity=cfg.wandb.get("entity", None),
+            tags=cfg.wandb.get("tags", []),
+            notes=cfg.wandb.get("notes", None),
+            save_dir=cfg.output_dir,
+        )
+        loggers.append(wandb_logger)
+    
+    trainer = pl.Trainer(
+        **cfg.trainer.params, 
+        callbacks=agent.get_training_callbacks(),
+        logger=loggers if loggers else None,
+    )
 
     logger.info("Starting Training")
     trainer.fit(

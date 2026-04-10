@@ -29,8 +29,12 @@ python -m navsim.planning.script.run_training \
     trainer.params.max_epochs=100 \
     +trainer.params.devices=4 \
     trainer.params.strategy=ddp_find_unused_parameters_true \
-    dataloader.params.batch_size=1 \
-    output_dir=/data2/byounggun/diffusiondrive_ar_output
+    dataloader.params.batch_size=8 \
+    agent.lr=2e-4 \
+    output_dir=/data2/byounggun/diffusiondrive_ar_output \
+    wandb.enabled=true \
+    wandb.project="diffusiondrive-ar" \
+    wandb.name="diffusiondrive_ar_v512"
 
 # For multi-GPU training, uncomment below:
 # python -m navsim.planning.script.run_training \
