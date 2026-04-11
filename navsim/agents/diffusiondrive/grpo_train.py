@@ -11,6 +11,7 @@ from pathlib import Path
 from navsim.agents.diffusiondrive.grpo_trainer import GRPOTrainer
 from navsim.agents.diffusiondrive.grpo_datamodule import GRPODataModule
 from navsim.agents.diffusiondrive.transfuser_config import TransfuserConfig
+from pytorch_lightning.loggers import WandbLogger
 
 
 @hydra.main(config_path="../../planning/script/config/training", config_name="default_training", version_base=None)
@@ -30,9 +31,9 @@ def main(cfg: DictConfig):
     datamodule = GRPODataModule(
         config=config,
         train_test_split=cfg.train_test_split,
-        navsim_log_path=cfg.navsim_log_path,
-        sensor_blobs_path=cfg.sensor_blobs_path,
-        metric_cache_path=cfg.metric_cache_path,
+        navsim_log_path=cfg.get('navsim_log_path'),
+        sensor_blobs_path=cfg.get('sensor_blobs_path'),
+        metric_cache_path=cfg.get('metric_cache_path'),
         batch_size=cfg.get('batch_size', 1),
         num_workers=cfg.dataloader.params.num_workers,
     )
@@ -60,13 +61,27 @@ def main(cfg: DictConfig):
         pl.callbacks.LearningRateMonitor(logging_interval='step'),
     ]
     
+    # Setup wandb logger if enabled
+    loggers = []
+    if cfg.wandb.get("enabled", False):
+        wandb_logger = WandbLogger(
+            project=cfg.wandb.project,
+            name=cfg.wandb.get("name", None),
+            entity=cfg.wandb.get("entity", None),
+            tags=cfg.wandb.get("tags", []),
+            notes=cfg.wandb.get("notes", None),
+            save_dir=cfg.output_dir,
+        )
+        loggers.append(wandb_logger)
+    
     # Setup trainer
     trainer = pl.Trainer(
-        max_epochs=cfg.trainer.max_epochs,
-        devices=cfg.trainer.devices,
-        strategy=cfg.trainer.strategy,
+        max_epochs=cfg.trainer.params.max_epochs,
+        devices=cfg.trainer.params.devices,
+        strategy=cfg.trainer.params.strategy,
         precision=cfg.trainer.params.precision,
         callbacks=callbacks,
+        logger=loggers if loggers else None,
         default_root_dir=cfg.output_dir,
         accumulate_grad_batches=cfg.trainer.params.accumulate_grad_batches,
         gradient_clip_val=cfg.trainer.params.gradient_clip_val,

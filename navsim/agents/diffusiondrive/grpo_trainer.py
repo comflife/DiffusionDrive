@@ -123,9 +123,26 @@ class GRPOTrainer(pl.LightningModule):
         """Setup PDM components."""
         if self.simulator is None:
             from hydra.utils import instantiate
-            # These should be provided via config
-            self.simulator = instantiate(self.trainer.datamodule.hparams.simulator)
-            self.scorer = instantiate(self.trainer.datamodule.hparams.scorer)
+            from omegaconf import OmegaConf
+            from pathlib import Path
+            
+            # Load default scoring config (uses 40 poses)
+            scoring_cfg = OmegaConf.load('navsim/planning/script/config/pdm_scoring/default_scoring_parameters.yaml')
+            self.simulator = instantiate(scoring_cfg.simulator)
+            self.scorer = instantiate(scoring_cfg.scorer)
+            
+            # Setup metric cache loader
+            from navsim.common.dataloader import MetricCacheLoader
+            metric_cache_path = getattr(self.hparams, 'metric_cache_path', '/data2/byounggun/metric_cache')
+            self.metric_cache_loader = MetricCacheLoader(Path(metric_cache_path))
+    
+    def _load_metric_cache(self, token: str):
+        """Load metric cache for a given token."""
+        import lzma
+        import pickle
+        metric_cache_path = self.metric_cache_loader.metric_cache_paths[token]
+        with lzma.open(metric_cache_path, "rb") as f:
+            return pickle.load(f)
     
     def forward(self, features: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """Forward pass through policy model."""
@@ -155,20 +172,30 @@ class GRPOTrainer(pl.LightningModule):
         self.policy_model.eval()
         
         for _ in range(group_size):
-            # Sample trajectory from policy
+            # Sample trajectory from policy with temperature
             with torch.no_grad():
                 output = self.policy_model(features, targets=None, temperature=self.temperature)
                 
-            trajectory = output['trajectory']  # [1, T, 2]
-            tokens = output.get('ego_tokens')  # [1, T]
-            log_probs = output.get('ego_log_probs')  # [1, T]
+            trajectory = output['trajectory']  # [B, T, 2] or [T, 2]
+            tokens = output.get('ego_tokens')  # [B, T] or [T]
+            ego_logits = output.get('ego_logits')  # [B, T, V]
             
+            # Handle batch dimension
             if trajectory.dim() == 3:
-                trajectory = trajectory[0]  # Remove batch dim
+                trajectory = trajectory[0]  # Remove batch dim -> [T, 2]
             if tokens is not None and tokens.dim() == 2:
-                tokens = tokens[0]
-            if log_probs is not None and log_probs.dim() == 2:
-                log_probs = log_probs[0]
+                tokens = tokens[0]  # -> [T]
+            if ego_logits is not None and ego_logits.dim() == 3:
+                ego_logits = ego_logits[0]  # -> [T, V]
+            
+            # Compute log_probs from logits
+            if ego_logits is not None and tokens is not None:
+                # Compute log_probs for sampled tokens
+                log_probs = F.log_softmax(ego_logits, dim=-1)
+                # Gather log probs for sampled tokens
+                token_log_probs = log_probs[torch.arange(len(tokens)), tokens]
+            else:
+                token_log_probs = None
             
             # Compute PDM reward
             reward = self._compute_pdm_reward(trajectory, metric_cache)
@@ -178,7 +205,7 @@ class GRPOTrainer(pl.LightningModule):
                 tokens=tokens,
                 trajectory=trajectory,
                 reward=reward,
-                log_probs=log_probs if log_probs is not None else torch.zeros_like(tokens, dtype=torch.float32)
+                log_probs=token_log_probs if token_log_probs is not None else torch.zeros_like(tokens, dtype=torch.float32)
             )
             rollouts.append(rollout)
             
@@ -191,9 +218,38 @@ class GRPOTrainer(pl.LightningModule):
             return 0.0
             
         try:
+            from navsim.common.dataclasses import Trajectory
+            from nuplan.planning.simulation.trajectory.trajectory_sampling import TrajectorySampling
+            import torch.nn.functional as F
+            
+            # trajectory is [T, 3] tensor with (x, y, heading) from model (8 timesteps)
+            # PDM expects 40 timesteps, so we need to interpolate
+            
+            model_num_poses = trajectory.shape[0]
+            target_num_poses = self.simulator.proposal_sampling.num_poses
+            
+            if model_num_poses != target_num_poses:
+                # Interpolate: [T, 3] -> [1, 3, T] -> interpolate -> [target_num_poses, 3]
+                traj_perm = trajectory.permute(1, 0).unsqueeze(0)  # [1, 3, T]
+                traj_interp = F.interpolate(
+                    traj_perm, 
+                    size=target_num_poses, 
+                    mode='linear', 
+                    align_corners=True
+                )
+                trajectory_3d = traj_interp.squeeze(0).permute(1, 0)  # [target_num_poses, 3]
+            else:
+                trajectory_3d = trajectory
+            
+            # Create Trajectory with PDM-compatible sampling
+            model_trajectory = Trajectory(
+                poses=trajectory_3d.cpu().numpy(),
+                trajectory_sampling=TrajectorySampling(time_horizon=4, interval_length=0.1)  # 40 poses
+            )
+            
             pdm_result = pdm_score(
                 metric_cache=metric_cache,
-                model_trajectory=trajectory,
+                model_trajectory=model_trajectory,
                 future_sampling=self.simulator.proposal_sampling,
                 simulator=self.simulator,
                 scorer=self.scorer,
@@ -202,6 +258,8 @@ class GRPOTrainer(pl.LightningModule):
             return pdm_result.score
         except Exception as e:
             print(f"PDM scoring failed: {e}")
+            import traceback
+            traceback.print_exc()
             return 0.0
     
     def compute_grpo_loss(
@@ -233,7 +291,8 @@ class GRPOTrainer(pl.LightningModule):
         
         for rollout, advantage in zip(rollouts, advantages):
             # Forward pass through policy (trainable)
-            features_batch = {k: v.unsqueeze(0) if v.dim() > 0 else v for k, v in rollout.features.items()}
+            # rollout.features are batched [B, ...], we need first sample for single rollout
+            features_batch = {k: v[0:1] if isinstance(v, torch.Tensor) and v.dim() > 0 else v for k, v in rollout.features.items()}
             policy_output = self.policy_model(features_batch, targets=None)
             
             # Get log probs from policy
@@ -249,6 +308,8 @@ class GRPOTrainer(pl.LightningModule):
             with torch.no_grad():
                 ref_output = self.reference_model(features_batch, targets=None)
                 ref_logits = ref_output.get('ego_logits')
+                if ref_logits is None:
+                    continue
                 ref_log_probs = F.log_softmax(ref_logits / self.temperature, dim=-1)
                 ref_token_log_probs = ref_log_probs[0, torch.arange(len(rollout.tokens)), rollout.tokens]
             
@@ -290,7 +351,10 @@ class GRPOTrainer(pl.LightningModule):
     
     def training_step(self, batch, batch_idx):
         """Training step with GRPO."""
-        features, targets, metric_cache = batch
+        features, targets, token = batch
+        
+        # Load metric cache dynamically (avoid DataLoader pickle issues)
+        metric_cache = self._load_metric_cache(token)
         
         # Sample rollouts (no gradient)
         rollouts = self.sample_rollouts(features, metric_cache, self.group_size)

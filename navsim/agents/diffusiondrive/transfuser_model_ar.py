@@ -296,7 +296,8 @@ class DiscreteARTrajectoryHead(nn.Module):
         bev_feature: torch.Tensor,
         agent_states: torch.Tensor,
         agent_labels: torch.Tensor,
-        targets: Optional[Dict[str, torch.Tensor]] = None
+        targets: Optional[Dict[str, torch.Tensor]] = None,
+        temperature: float = 0.0
     ) -> Dict[str, torch.Tensor]:
         """
         Forward pass.
@@ -308,6 +309,7 @@ class DiscreteARTrajectoryHead(nn.Module):
             agent_states: [B, N, state_dim]
             agent_labels: [B, N]
             targets: Optional training targets with 'trajectory' [B, T, 3]
+            temperature: Sampling temperature for inference (0 = deterministic)
         """
         B = ego_query.shape[0]
         M = self.ego_fut_mode
@@ -343,7 +345,7 @@ class DiscreteARTrajectoryHead(nn.Module):
             )
         else:
             return self._forward_test(
-                ego_base, agent_kv, bev_feat, topk_valid, B, M, T, D, device
+                ego_base, agent_kv, bev_feat, topk_valid, B, M, T, D, device, temperature
             )
     
     def _forward_train(
@@ -395,13 +397,18 @@ class DiscreteARTrajectoryHead(nn.Module):
             'trajectory_loss': loss,
             'trajectory': ego_pred[:, 0],
             'ego_tokens': ego_tokens,
+            'ego_logits': logits[:, 0],  # [B, T, V] - for GRPO
         }
     
     def _forward_test(
         self, ego_base, agent_kv, bev_feat, topk_valid,
-        B, M, T, D, device
+        B, M, T, D, device, temperature: float = 0.0
     ):
-        """Inference with AR decoding."""
+        """Inference with AR decoding.
+        
+        Args:
+            temperature: Sampling temperature. 0 means deterministic (argmax).
+        """
         mode_e = self.ego_mode_emb.weight.view(1, M, 1, D)
         step_e = self.step_emb.weight.view(1, 1, T, D)
         role_e = self.role_emb.weight[0].view(1, 1, 1, D)
@@ -414,17 +421,26 @@ class DiscreteARTrajectoryHead(nn.Module):
         input_embs[:, :, 0, :] = bos
         
         predicted_tokens = []
+        all_logits = []  # Store logits for each step
         for t in range(T):
             ego_q = input_embs + step_e + role_e + mode_e
             ego_out = self._attn_stack(ego_q, agent_kv, bev_feat, topk_valid)
-            logit_t = self.ego_token_head(ego_out[:, :, t, :])
-            tok_t = logit_t.argmax(-1)
+            logit_t = self.ego_token_head(ego_out[:, :, t, :])  # [B, M, V]
+            all_logits.append(logit_t)
+            
+            # Sample token with temperature
+            if temperature > 0:
+                probs = F.softmax(logit_t / temperature, dim=-1)
+                tok_t = torch.multinomial(probs.view(-1, self.ego_vocab_size), 1).view(B, M)
+            else:
+                tok_t = logit_t.argmax(-1)
             predicted_tokens.append(tok_t)
             
             if t < T - 1:
                 input_embs[:, :, t + 1, :] = self.ego_token_emb(tok_t)
         
         ego_tokens = torch.stack(predicted_tokens, dim=2)
+        ego_logits = torch.stack(all_logits, dim=2)  # [B, M, T, V]
         
         # Lookup codebook: [B, M, T] -> [B, M, T, 2]
         # ego_codebook shape: [V, 2]
@@ -440,6 +456,7 @@ class DiscreteARTrajectoryHead(nn.Module):
             'trajectory': ego_pred_full[:, 0],
             'trajectory_modes': ego_pred_full,
             'ego_tokens': ego_tokens,
+            'ego_logits': ego_logits[:, 0],  # [B, T, V] - for GRPO
         }
 
 
@@ -517,9 +534,16 @@ class V2TransfuserModelAR(nn.Module):
     def forward(
         self,
         features: Dict[str, torch.Tensor],
-        targets: Optional[Dict[str, torch.Tensor]] = None
+        targets: Optional[Dict[str, torch.Tensor]] = None,
+        temperature: float = 0.0
     ) -> Dict[str, torch.Tensor]:
-        """Forward pass."""
+        """Forward pass.
+        
+        Args:
+            features: Input features dict
+            targets: Optional training targets
+            temperature: Sampling temperature for AR inference (0 = deterministic)
+        """
         camera_feature: torch.Tensor = features["camera_feature"]
         lidar_feature: torch.Tensor = features["lidar_feature"]
         status_feature: torch.Tensor = features["status_feature"]
@@ -571,7 +595,8 @@ class V2TransfuserModelAR(nn.Module):
             cross_bev_feature,
             agents["agent_states"],
             agents["agent_labels"],
-            targets=targets
+            targets=targets,
+            temperature=temperature
         )
         output.update(trajectory)
         

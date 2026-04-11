@@ -11,9 +11,8 @@ import lzma
 import pickle
 
 from navsim.common.dataclasses import SceneFilter
-from navsim.common.dataloader import SceneLoader
+from navsim.common.dataloader import SceneLoader, MetricCacheLoader
 from navsim.planning.metric_caching.metric_cache import MetricCache
-from navsim.planning.metric_caching.metric_cache_loader import MetricCacheLoader
 from navsim.agents.diffusiondrive.transfuser_features import TransfuserFeatureBuilder, TransfuserTargetBuilder
 
 
@@ -40,18 +39,33 @@ class GRPOEpisodeDataset(Dataset):
         self.feature_builders = feature_builders
         self.target_builders = target_builders
         
+        # Debug info
+        scene_tokens = set(scene_loader.tokens)
+        cache_tokens = set(metric_cache_loader.tokens)
+        print(f"SceneLoader: {len(scene_tokens)} tokens")
+        print(f"MetricCacheLoader: {len(cache_tokens)} tokens")
+        
         # Filter tokens that exist in both
         if tokens is None:
-            self.tokens = list(
-                set(scene_loader.tokens) & set(metric_cache_loader.tokens)
-            )
+            self.tokens = list(scene_tokens & cache_tokens)
         else:
-            self.tokens = [
-                t for t in tokens 
-                if t in scene_loader.tokens and t in metric_cache_loader.tokens
-            ]
+            requested_tokens = set(tokens)
+            self.tokens = list(requested_tokens & scene_tokens & cache_tokens)
+            print(f"Requested: {len(requested_tokens)} tokens")
         
-        print(f"GRPO Dataset: {len(self.tokens)} valid tokens")
+        print(f"GRPO Dataset: {len(self.tokens)} valid tokens (intersection)")
+        
+        # Show some examples of missing tokens
+        if len(self.tokens) == 0:
+            if len(scene_tokens) > 0:
+                print(f"Sample scene tokens: {list(scene_tokens)[:5]}")
+            if len(cache_tokens) > 0:
+                print(f"Sample cache tokens: {list(cache_tokens)[:5]}")
+            if tokens is not None and len(tokens) > 0:
+                sample_token = tokens[0]
+                print(f"Sample requested token: {sample_token}")
+                print(f"  In scene_loader: {sample_token in scene_tokens}")
+                print(f"  In cache_loader: {sample_token in cache_tokens}")
         
     def __len__(self):
         return len(self.tokens)
@@ -60,24 +74,28 @@ class GRPOEpisodeDataset(Dataset):
         token = self.tokens[idx]
         
         # Get agent input
-        agent_input = self.scene_loader.get_agent_input_from_token(token)
+        try:
+            agent_input = self.scene_loader.get_agent_input_from_token(token)
+        except FileNotFoundError as e:
+            print(f"Warning: Missing sensor data for token {token}: {e}")
+            # Return a different sample
+            return self.__getitem__((idx + 1) % len(self.tokens))
         
-        # Build features
+        # Build features (use compute_features, not build)
         features = {}
         for builder in self.feature_builders:
-            features.update(builder.build(agent_input))
+            features.update(builder.compute_features(agent_input))
         
-        # Build targets
+        # Build targets (need scene for targets)
+        # Load scene for target computation
+        scene = self.scene_loader.get_scene_from_token(token)
         targets = {}
         for builder in self.target_builders:
-            targets.update(builder.build(agent_input))
+            targets.update(builder.compute_targets(scene))
         
-        # Load metric cache
-        metric_cache_path = self.metric_cache_loader.metric_cache_paths[token]
-        with lzma.open(metric_cache_path, "rb") as f:
-            metric_cache: MetricCache = pickle.load(f)
-        
-        return features, targets, metric_cache
+        # Return token instead of metric_cache (will be loaded lazily in trainer)
+        # This avoids pickle issues with DataLoader
+        return features, targets, token
 
 
 class GRPODataModule(pl.LightningDataModule):
@@ -103,19 +121,32 @@ class GRPODataModule(pl.LightningDataModule):
         """Setup datasets."""
         from hydra.utils import instantiate
         
-        # Build scene filter
+        # Build scene filter (similar to run_training.py)
         scene_filter: SceneFilter = instantiate(self.train_test_split.scene_filter)
+        
+        # Filter log_names based on train_logs if available
+        train_logs = getattr(self.train_test_split, 'train_logs', None)
+        if train_logs is not None:
+            if scene_filter.log_names is not None:
+                scene_filter.log_names = [
+                    log_name for log_name in scene_filter.log_names if log_name in train_logs
+                ]
+            else:
+                scene_filter.log_names = train_logs
+        
+        print(f"Scene filter: {len(scene_filter.log_names) if scene_filter.log_names else 'all'} logs")
         
         # Feature/target builders
         feature_builders = [TransfuserFeatureBuilder(config=self.config)]
         target_builders = [TransfuserTargetBuilder(config=self.config)]
         
-        # Scene loader
+        # Scene loader - use all sensors (needed for feature computation)
+        from navsim.common.dataclasses import SensorConfig
         scene_loader = SceneLoader(
             sensor_blobs_path=Path(self.hparams.sensor_blobs_path),
             data_path=Path(self.hparams.navsim_log_path),
             scene_filter=scene_filter,
-            sensor_config=feature_builders[0].get_sensor_config(),
+            sensor_config=SensorConfig.build_all_sensors(),
         )
         
         # Metric cache loader
@@ -140,27 +171,19 @@ class GRPODataModule(pl.LightningDataModule):
         )
     
     def _collate_fn(self, batch):
-        """Custom collate for GRPO batch."""
-        # Each item is (features, targets, metric_cache)
-        # metric_cache is not tensor, handle separately
-        features_list, targets_list, metric_caches = zip(*batch)
+        """Custom collate for GRPO batch.
         
-        # Stack features
-        features = {}
-        for key in features_list[0].keys():
-            values = [f[key] for f in features_list]
-            if isinstance(values[0], torch.Tensor):
-                features[key] = torch.stack(values)
-            else:
-                features[key] = values
+        NOTE: We assume batch_size=1 for GRPO training.
+        This avoids complex collate logic for metric_cache.
+        """
+        # batch is a list of (features, targets, token) tuples
+        features, targets, token = batch[0]
         
-        # Stack targets
-        targets = {}
-        for key in targets_list[0].keys():
-            values = [t[key] for t in targets_list]
-            if isinstance(values[0], torch.Tensor):
-                targets[key] = torch.stack(values)
-            else:
-                targets[key] = values
+        # Add batch dimension only to tensor values
+        features_batch = {k: v.unsqueeze(0) if isinstance(v, torch.Tensor) else v 
+                         for k, v in features.items()}
+        targets_batch = {k: v.unsqueeze(0) if isinstance(v, torch.Tensor) else v 
+                        for k, v in targets.items()}
         
-        return features, targets, metric_caches
+        # Return token as-is
+        return features_batch, targets_batch, token
