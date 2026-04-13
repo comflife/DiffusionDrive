@@ -26,4 +26,4 @@ config:
   freeze_pretrained_trunk: true
 
 checkpoint_path: /home/byounggun/DiffusionDrive/diffusiondrive_navsim_88p1_PDMS
-lr: 1e-4
+lr: 2e-4

@@ -30,9 +30,9 @@ python -m navsim.planning.script.run_training \
     +experiment_name=diffusiondrive_ar_v512 \
     trainer.params.max_epochs=100 \
     +trainer.params.devices=4 \
-    trainer.params.strategy=ddp_find_unused_parameters_true \
-    dataloader.params.batch_size=32 \
-    agent.lr=1e-4 \
+    trainer.params.strategy=ddp \
+    dataloader.params.batch_size=64 \
+    agent.lr=2e-4 \
     agent.checkpoint_path=/home/byounggun/DiffusionDrive/diffusiondrive_navsim_88p1_PDMS \
     agent.config.ar_num_modes=1 \
     agent.config.ar_token_loss_weight=1.0 \
