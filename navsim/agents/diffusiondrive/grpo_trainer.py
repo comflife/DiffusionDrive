@@ -24,6 +24,7 @@ Fixes applied (v2):
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from contextlib import contextmanager
 from typing import Dict, List, Tuple, Optional
 import numpy as np
 from dataclasses import dataclass
@@ -129,6 +130,16 @@ class GRPOTrainer(pl.LightningModule):
             param.requires_grad = False
         model.eval()
 
+    @contextmanager
+    def _temporary_eval_mode(self, model: nn.Module):
+        """Temporarily disable dropout while preserving autograd."""
+        was_training = model.training
+        model.eval()
+        try:
+            yield
+        finally:
+            model.train(was_training)
+
     # ------------------------------------------------------------------
     # Setup (PDM scorer / metric cache)
     # ------------------------------------------------------------------
@@ -211,6 +222,7 @@ class GRPOTrainer(pl.LightningModule):
             # --- tokens: [B, M, T] → [T]  (Bug 3 fix: was checking dim==2) ---
             if tokens is not None:
                 if tokens.dim() == 3:
+                    # GRPO currently optimizes the primary planning mode only.
                     tokens = tokens[0, 0]   # batch-0, mode-0 → [T]
                 elif tokens.dim() == 2:
                     tokens = tokens[0]      # mode-0 → [T]
@@ -404,15 +416,16 @@ class GRPOTrainer(pl.LightningModule):
         # compute_token_log_probs() conditions each step t on the ROLLOUT tokens
         # a_0,...,a_{t-1} (via BOS-shifted teacher forcing), not on model's own
         # predictions.  This gives the correct π_θ(a_t | s, a_{<t}).
-        self.policy_model.train()
-        new_token_log_probs, _ = self.policy_model.compute_token_log_probs(
-            batched_features, all_tokens
-        )  # [G, T]
+        with self._temporary_eval_mode(self.policy_model):
+            new_token_log_probs, new_logits = self.policy_model.compute_token_log_probs(
+                batched_features, all_tokens
+            )  # [G, T], [G, T, V]
 
         with torch.no_grad():
-            ref_token_log_probs, _ = self.reference_model.compute_token_log_probs(
-                batched_features, all_tokens
-            )  # [G, T]
+            with self._temporary_eval_mode(self.reference_model):
+                ref_token_log_probs, ref_logits = self.reference_model.compute_token_log_probs(
+                    batched_features, all_tokens
+                )  # [G, T], [G, T, V]
 
         # Bug 4: PPO importance ratio w/ clipping
         ratio         = torch.exp(new_token_log_probs - all_old_log_probs)  # [G, T]
@@ -424,8 +437,11 @@ class GRPOTrainer(pl.LightningModule):
         # Bug 1 fix: .mean() over tokens (not .sum())
         pg_loss = -torch.min(ratio * adv_expanded, ratio_clipped * adv_expanded).mean()
 
-        # KL penalty: per-token mean  (Bug 1 fix)
-        kl_loss = (new_token_log_probs - ref_token_log_probs).mean()
+        # True categorical KL is more stable than sampled log-prob differences.
+        new_log_probs_all = F.log_softmax(new_logits, dim=-1)
+        ref_log_probs_all = F.log_softmax(ref_logits, dim=-1)
+        new_probs_all = new_log_probs_all.exp()
+        kl_loss = (new_probs_all * (new_log_probs_all - ref_log_probs_all)).sum(dim=-1).mean()
 
         total_loss = pg_loss + self.kl_coef * kl_loss
 

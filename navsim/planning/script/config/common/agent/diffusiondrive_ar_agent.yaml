@@ -19,6 +19,11 @@ config:
   agent_topk: 8
   agent_context_dim: 256
   temperature: 0.0  # default greedy; override with +agent.config.temperature=0.8 for stochastic sampling in AR head
+  ar_num_modes: 1
+  ar_token_loss_weight: 1.0
+  ar_traj_loss_weight: 8.0
+  ar_heading_loss_weight: 2.0
+  freeze_pretrained_trunk: true
 
-checkpoint_path: null
-lr: 6e-4
+checkpoint_path: /home/byounggun/DiffusionDrive/diffusiondrive_navsim_88p1_PDMS
+lr: 1e-4

@@ -135,6 +135,11 @@ class TransfuserConfig:
     agent_topk: int = 8        # Number of top agents to use as context
     agent_context_dim: int = 256  # Dimension for agent continuous feature encoding
     temperature: float = 0.0   # Sampling temperature for AR decoding (0.0=greedy, >0=multinomial for diversity)
+    ar_num_modes: int = 1      # Use a single AR policy stream for SFT / GRPO
+    ar_token_loss_weight: float = 1.0
+    ar_traj_loss_weight: float = 8.0
+    ar_heading_loss_weight: float = 2.0
+    freeze_pretrained_trunk: bool = True
     # optimizer=dict(
     #     type="AdamW",
     #     lr=1e-4,

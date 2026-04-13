@@ -114,6 +114,30 @@ class TransfuserAgentAR(AbstractAgent):
             if self._checkpoint_path:
                 print(f"Checkpoint not found at: {self._checkpoint_path}")
             print("Initializing from scratch (no pretrained weights).")
+
+        if getattr(self._config, "freeze_pretrained_trunk", False):
+            self._freeze_pretrained_trunk()
+
+    def _freeze_pretrained_trunk(self):
+        """Freeze the pretrained DiffusionDrive trunk and train AR trajectory head only."""
+        trainable_prefixes = [
+            "_trajectory_head.",
+        ]
+
+        total_params = 0
+        trainable_params = 0
+        for name, param in self._transfuser_model.named_parameters():
+            total_params += param.numel()
+            should_train = any(name.startswith(prefix) for prefix in trainable_prefixes)
+            param.requires_grad = should_train
+            if should_train:
+                trainable_params += param.numel()
+
+        frozen_params = total_params - trainable_params
+        print(
+            "Froze pretrained trunk: "
+            f"trainable={trainable_params:,}, frozen={frozen_params:,}"
+        )
             
     def name(self) -> str:
         """Inherited, see superclass."""
@@ -184,10 +208,16 @@ class TransfuserAgentAR(AbstractAgent):
                 traj_loss = torch.nn.functional.l1_loss(pred_traj, gt_traj)
         
         # Return dict with loss components for logging
-        return {
+        loss_dict = {
             'loss': traj_loss,
             'trajectory_loss': traj_loss,
         }
+
+        for key in ['token_loss', 'traj_loss', 'heading_loss']:
+            if key in predictions:
+                loss_dict[key] = predictions[key]
+
+        return loss_dict
 
     def get_optimizers(self) -> Union[Optimizer, Dict[str, Union[Optimizer, LRScheduler]]]:
         """Inherited, see superclass."""

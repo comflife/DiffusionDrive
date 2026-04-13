@@ -81,12 +81,15 @@ class DiscreteARTrajectoryHead(nn.Module):
         self._config    = config
 
         # Discrete AR parameters for EGO only
-        self.ego_fut_mode  = 20   # Number of planning modes
+        self.ego_fut_mode  = getattr(config, 'ar_num_modes', 1)
         self.agent_topk    = getattr(config, 'agent_topk', 8)
         self.score_thresh  = 0.05
         self.num_layers    = 2
         self.num_heads     = 8
         self.dropout       = 0.1
+        self.token_loss_weight = getattr(config, 'ar_token_loss_weight', 1.0)
+        self.traj_loss_weight = getattr(config, 'ar_traj_loss_weight', 8.0)
+        self.heading_loss_weight = getattr(config, 'ar_heading_loss_weight', 2.0)
 
         # Ego vocabulary
         self.ego_vocab_size = getattr(config, 'ego_vocab_size', 512)
@@ -164,6 +167,16 @@ class DiscreteARTrajectoryHead(nn.Module):
 
         # Ego prediction head
         self.ego_token_head = nn.Linear(d_model, self.ego_vocab_size)
+        self.ego_delta_head = nn.Sequential(
+            nn.Linear(d_model, d_ffn),
+            nn.GELU(),
+            nn.Linear(d_ffn, 2),
+        )
+        self.ego_heading_head = nn.Sequential(
+            nn.Linear(d_model, d_ffn),
+            nn.GELU(),
+            nn.Linear(d_ffn, 1),
+        )
 
         self._init_weights()
 
@@ -200,6 +213,11 @@ class DiscreteARTrajectoryHead(nn.Module):
 
         nn.init.xavier_uniform_(self.ego_token_head.weight)
         nn.init.zeros_(self.ego_token_head.bias)
+        for head in [self.ego_delta_head, self.ego_heading_head]:
+            for module in head:
+                if isinstance(module, nn.Linear):
+                    nn.init.xavier_uniform_(module.weight)
+                    nn.init.zeros_(module.bias)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -207,6 +225,19 @@ class DiscreteARTrajectoryHead(nn.Module):
 
     def _causal_mask(self, T: int, device: torch.device) -> torch.Tensor:
         return torch.triu(torch.ones(T, T, device=device, dtype=torch.bool), diagonal=1)
+
+    def _build_trajectory(
+        self,
+        hidden: torch.Tensor,   # [B, M, T, D]
+        tokens: torch.Tensor,   # [B, M, T]
+    ) -> torch.Tensor:
+        """Decode discrete tokens plus learned residuals into poses."""
+        token_deltas = self.ego_codebook[tokens]          # [B, M, T, 2]
+        residual_deltas = self.ego_delta_head(hidden)     # [B, M, T, 2]
+        deltas_xy = token_deltas + residual_deltas
+        pos_xy = deltas_xy.cumsum(dim=2)
+        heading = self.ego_heading_head(hidden)
+        return torch.cat([pos_xy, heading], dim=-1)
 
     def select_topk_agents(
         self,
@@ -333,21 +364,31 @@ class DiscreteARTrajectoryHead(nn.Module):
         ego_q  = self._attn_stack(ego_q, agent_kv, bev_feat, topk_valid)
         logits = self.ego_token_head(ego_q)  # [B, M, T, V]
 
-        loss = F.cross_entropy(
+        token_loss = F.cross_entropy(
             logits.reshape(-1, self.ego_vocab_size),
             ego_gt_tokens.reshape(-1),
             reduction='mean',
         )
 
         ego_tokens = logits.argmax(-1)
-        ego_offsets = self.ego_codebook[ego_tokens]   # [B, M, T, 2]
-        ego_pred    = ego_offsets.cumsum(dim=2)
+        ego_pred = self._build_trajectory(ego_q, ego_gt_tokens)
+
+        traj_loss = F.smooth_l1_loss(ego_pred[..., :2], gt_traj[..., :2], reduction='mean')
+        heading_loss = F.smooth_l1_loss(ego_pred[..., 2:], gt_traj[..., 2:], reduction='mean')
+        loss = (
+            self.token_loss_weight * token_loss
+            + self.traj_loss_weight * traj_loss
+            + self.heading_loss_weight * heading_loss
+        )
 
         return {
             'trajectory_loss': loss,
             'trajectory':      ego_pred[:, 0],
             'ego_tokens':      ego_tokens,
             'ego_logits':      logits[:, 0],   # [B, T, V] – for GRPO
+            'token_loss':      token_loss.detach(),
+            'traj_loss':       traj_loss.detach(),
+            'heading_loss':    heading_loss.detach(),
         }
 
     def _forward_test(
@@ -388,12 +429,8 @@ class DiscreteARTrajectoryHead(nn.Module):
 
         ego_tokens = torch.stack(predicted_tokens, dim=2)    # [B, M, T]
         ego_logits = torch.stack(all_logits,        dim=2)   # [B, M, T, V]
-
-        ego_offsets = self.ego_codebook[ego_tokens]          # [B, M, T, 2]
-        ego_pred    = ego_offsets.cumsum(dim=2)
-
-        heading       = torch.zeros(B, M, T, 1, device=device)
-        ego_pred_full = torch.cat([ego_pred, heading], dim=-1)  # [B, M, T, 3]
+        ego_hidden = self._attn_stack(input_embs + step_e + role_e + mode_e, agent_kv, bev_feat, topk_valid)
+        ego_pred_full = self._build_trajectory(ego_hidden, ego_tokens)
 
         return {
             'trajectory':       ego_pred_full[:, 0],
