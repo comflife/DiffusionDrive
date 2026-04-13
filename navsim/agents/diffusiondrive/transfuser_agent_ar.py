@@ -79,10 +79,17 @@ class TransfuserAgentAR(AbstractAgent):
             
             # Remove common prefixes from checkpoint keys
             # Handle both 'agent._transfuser_model.' and '_transfuser_model.' prefixes
+            # Also handle GRPO checkpoints which use 'policy_model.' prefix
             new_state_dict = {}
             for k, v in state_dict.items():
+                # Skip GRPO reference model (frozen copy, not needed for inference)
+                if k.startswith('reference_model.'):
+                    continue
+                # Convert GRPO policy_model prefix
+                elif k.startswith('policy_model.'):
+                    new_key = k[len('policy_model.'):]
                 # Remove 'agent._transfuser_model.' or '_transfuser_model.' prefix
-                if k.startswith('agent._transfuser_model.'):
+                elif k.startswith('agent._transfuser_model.'):
                     new_key = k[len('agent._transfuser_model.'):]
                 elif k.startswith('_transfuser_model.'):
                     new_key = k[len('_transfuser_model.'):]

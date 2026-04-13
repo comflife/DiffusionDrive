@@ -57,9 +57,9 @@ from navsim.visualization.camera import add_camera_ax
 
 # ── Default Paths ────────────────────────────────────────────────────
 # GRPO model checkpoint (first epoch)
-DEFAULT_CKPT = "/data2/byounggun/diffusiondrive_grpo_output_v2/checkpoints/grpo-epoch=00.ckpt"
+DEFAULT_CKPT = "/data2/byounggun/diffusiondrive_grpo_output_v3/checkpoints/last.ckpt"
 # Update this path after running GRPO evaluation
-DEFAULT_CSV = "/data2/byounggun/diffusiondrive_grpo_output_v2/eval_epoch0/2026.04.13.15.52.18.csv"
+DEFAULT_CSV = "/data2/byounggun/diffusiondrive_grpo_output_v3/eval_latest/grpo_results.csv"
 DEFAULT_METRIC_CACHE = "/data2/byounggun/metric_cache"
 DEFAULT_DATA_DIR = "/data/navsim/dataset"
 DEFAULT_OUTPUT_DIR = "/home/byounggun/DiffusionDrive/plots/grpo_visualization"

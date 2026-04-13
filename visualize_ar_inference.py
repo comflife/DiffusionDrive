@@ -6,7 +6,7 @@ Loads the AR model, evaluates on selected scenes from NAVSIM,
 and saves BEV + camera visualizations with PDM scores.
 
 Usage:
-    python visualize_ar_inference.py [--gpu 0] [--num_scenes 20] [--mode worst]
+    python visualize_ar_inference.py [--gpu 0] [--num_scenes 20] [--mode worst] [--temperature 0.8]
 """
 
 import argparse
@@ -40,7 +40,7 @@ from navsim.agents.diffusiondrive.transfuser_agent_ar import TransfuserAgentAR
 from navsim.agents.diffusiondrive.transfuser_config import TransfuserConfig
 from navsim.agents.human_agent import HumanAgent
 from navsim.evaluate.pdm_score import pdm_score
-from navsim.common.dataclasses import SceneFilter, SensorConfig
+from navsim.common.dataclasses import SceneFilter, SensorConfig, Trajectory
 from navsim.common.dataloader import SceneLoader, MetricCacheLoader
 from navsim.planning.simulation.planner.pdm_planner.simulation.pdm_simulator import PDMSimulator
 from navsim.planning.simulation.planner.pdm_planner.scoring.pdm_scorer import PDMScorer
@@ -77,6 +77,7 @@ def parse_args():
         choices=["worst", "best", "random", "mixed", "zero_nc", "zero_dac"],
         help="Scene selection mode: worst/best/random/mixed/zero_nc/zero_dac"
     )
+    parser.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature (0.0 = greedy, >0 = stochastic)")
     parser.add_argument("--split", type=str, default="test", help="Data split: test or trainval")
     return parser.parse_args()
 
@@ -269,6 +270,7 @@ def main():
     os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
+    print(f"Sampling temperature: {args.temperature}")
 
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
@@ -359,9 +361,24 @@ def main():
             metric_cache = metric_cache_loader.get_from_token(token)
             agent_input = val_scene_loader.get_agent_input_from_token(token)
 
-            # Run AR model inference (on GPU)
+            # Run AR model inference (on GPU) with temperature for diversity
             with torch.no_grad():
+                # Patch compute_trajectory to support temperature (since it hardcodes default=0.0)
+                original_compute = model.compute_trajectory
+                def temp_compute(agent_input):
+                    # Re-implement with temperature (bypassing abstract default)
+                    model.eval()
+                    device = next(model.parameters()).device
+                    features = {}
+                    for builder in model.get_feature_builders():
+                        features.update(builder.compute_features(agent_input))
+                    features = {k: v.unsqueeze(0).to(device) for k, v in features.items()}
+                    predictions = model._transfuser_model(features, temperature=args.temperature)
+                    poses = predictions["trajectory"].squeeze(0).cpu().numpy()
+                    return Trajectory(poses)
+                model.compute_trajectory = temp_compute
                 ar_trajectory = model.compute_trajectory(agent_input)
+                model.compute_trajectory = original_compute  # restore
 
             # Get human trajectory
             human_trajectory = human_agent.compute_trajectory(agent_input, scene)

@@ -20,24 +20,18 @@ if [ ! -f "$PRETRAINED_CKPT" ]; then
 fi
 
 echo "=================================================="
-echo "DiffusionDrive-AR GRPO Fine-tuning (v2 fixed)"
+echo "DiffusionDrive-AR GRPO Fine-tuning (v3 - eval-matched)"
 echo "=================================================="
 echo "Pretrained checkpoint: $PRETRAINED_CKPT"
 echo ""
 echo "Key fixes from v1:"
-echo "  [Bug1] loss sum→mean (was causing 200↔-40 explosion)"
-echo "  [Bug2] teacher-forced log prob (correct AR conditioning)"
-echo "  [Bug3] dim handling for ego_tokens [B,M,T]"
-echo "  [Bug4] PPO importance ratio + clipping"
-echo "  [Bug5] std clamp + advantage clipping"
-echo ""
-echo "GRPO Settings v2:"
+echo "GRPO Settings v3:"
 echo "  - Data   : navtest (matching metric cache)"
-echo "  - Group  : 8 rollouts/scene  (was 4 → too few for variance)"
-echo "  - Temp   : 1.0               (was 0.5 → too concentrated)"
-echo "  - KL coef: 0.01              (was 0.1 → was too restrictive)"
+echo "  - Group  : 16 rollouts/scene  (more samples → better selection)"
+echo "  - Temp   : 0.3                 (train/eval matched)"
+echo "  - KL coef: 0.1                 (prevent drift from 56.4% baseline)"
 echo "  - clip_eps: 0.2 (PPO)"
-echo "  - LR     : 5e-6"
+echo "  - LR     : 1e-6                (slower, more stable)"
 echo "=================================================="
 
 cd $NAVSIM_DEVKIT_ROOT
@@ -52,32 +46,28 @@ ln -s "$PRETRAINED_CKPT" "$SAFE_CKPT"
 # Run GRPO training
 # IMPORTANT changes vs v1:
 #   train_test_split=navtest  (matching metric cache)
-#   group_size=8               (was 4 → need more rollouts to get reward variance)
-#   temperature=1.0            (was 0.5 → too peaked, all rollouts similar)
-#   kl_coef=0.01               (was 0.1 → too high, blocks updates even with advantages)
-#   ++clip_eps=0.2             (new PPO clipping parameter)
 python3 -m navsim.agents.diffusiondrive.grpo_train \
     train_test_split=navtest \
     ++checkpoint_path="$SAFE_CKPT" \
     ++metric_cache_path=/data2/byounggun/metric_cache \
     navsim_log_path="$OPENSCENE_DATA_ROOT/navsim_logs/test" \
     sensor_blobs_path="$OPENSCENE_DATA_ROOT/sensor_blobs/test" \
-    output_dir=/data2/byounggun/diffusiondrive_grpo_output_v2 \
-    ++experiment_name=diffusiondrive_ar_grpo_v2 \
+    output_dir=/data2/byounggun/diffusiondrive_grpo_output_v3 \
+    ++experiment_name=diffusiondrive_ar_grpo_v3 \
     ++trainer.params.max_epochs=20 \
     ++trainer.params.devices=4 \
     ++trainer.params.strategy=ddp_find_unused_parameters_true \
     ++trainer.params.gradient_clip_val=1.0 \
     ++batch_size=1 \
     ++num_workers=0 \
-    ++group_size=8 \
-    ++kl_coef=0.01 \
+    ++group_size=16 \
+    ++kl_coef=0.1 \
     ++clip_eps=0.2 \
-    ++lr=5e-6 \
-    ++temperature=1.0 \
+    ++lr=1e-6 \
+    ++temperature=0.3 \
     wandb.enabled=true \
     wandb.project="diffusiondrive-grpo" \
-    wandb.name="grpo_v2_navtrain_g8_t1.0"
+    wandb.name="grpo_v3_navtrain_g16_t0.3"
 
 echo "=================================================="
 echo "GRPO Training Complete!"
