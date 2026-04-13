@@ -66,18 +66,25 @@ class AbstractAgent(torch.nn.Module, ABC):
         :return: Trajectory representing the predicted ego's position in future
         """
         self.eval()
+
+        # Determine device from model parameters
+        try:
+            device = next(self.parameters()).device
+        except StopIteration:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
         features: Dict[str, torch.Tensor] = {}
         # build features
         for builder in self.get_feature_builders():
             features.update(builder.compute_features(agent_input))
 
-        # add batch dimension
-        features = {k: v.unsqueeze(0) for k, v in features.items()}
+        # add batch dimension and move to model device
+        features = {k: v.unsqueeze(0).to(device) for k, v in features.items()}
 
         # forward pass
         with torch.no_grad():
             predictions = self.forward(features)
-            poses = predictions["trajectory"].squeeze(0).numpy()
+            poses = predictions["trajectory"].squeeze(0).cpu().numpy()
 
         # extract trajectory
         return Trajectory(poses)

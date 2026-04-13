@@ -140,13 +140,14 @@ class GRPODataModule(pl.LightningDataModule):
         feature_builders = [TransfuserFeatureBuilder(config=self.config)]
         target_builders = [TransfuserTargetBuilder(config=self.config)]
         
-        # Scene loader - use all sensors (needed for feature computation)
+        # Scene loader - only load current frame sensors (include=[3])
+        # to match TransfuserAgentAR.get_sensor_config() and save memory
         from navsim.common.dataclasses import SensorConfig
         scene_loader = SceneLoader(
             sensor_blobs_path=Path(self.hparams.sensor_blobs_path),
             data_path=Path(self.hparams.navsim_log_path),
             scene_filter=scene_filter,
-            sensor_config=SensorConfig.build_all_sensors(),
+            sensor_config=SensorConfig.build_all_sensors(include=[3]),
         )
         
         # Metric cache loader

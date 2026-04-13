@@ -28,6 +28,9 @@ def main(cfg: DictConfig):
     )
     
     # Setup datamodule
+    # NOTE: Use top-level num_workers override if provided (e.g., ++num_workers=0),
+    # otherwise fall back to dataloader.params.num_workers from default_training.yaml
+    num_workers = cfg.get('num_workers', cfg.dataloader.params.num_workers)
     datamodule = GRPODataModule(
         config=config,
         train_test_split=cfg.train_test_split,
@@ -35,17 +38,19 @@ def main(cfg: DictConfig):
         sensor_blobs_path=cfg.get('sensor_blobs_path'),
         metric_cache_path=cfg.get('metric_cache_path'),
         batch_size=cfg.get('batch_size', 1),
-        num_workers=cfg.dataloader.params.num_workers,
+        num_workers=num_workers,
     )
     
     # Setup model
     model = GRPOTrainer(
         config=config,
         checkpoint_path=cfg.get('checkpoint_path'),
+        metric_cache_path=cfg.get('metric_cache_path'),
         lr=cfg.get('lr', 1e-5),
         group_size=cfg.get('group_size', 8),
         kl_coef=cfg.get('kl_coef', 0.01),
         temperature=cfg.get('temperature', 1.0),
+        clip_eps=cfg.get('clip_eps', 0.2),   # PPO clipping epsilon
     )
     
     # Setup callbacks

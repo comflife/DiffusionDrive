@@ -115,12 +115,19 @@ class TransfuserAgentAR(AbstractAgent):
     def initialize(self) -> None:
         """Inherited, see superclass.
         
-        For evaluation, load the full trained model (backbone + AR head).
-        This is called after __init__, so we skip if already loaded in init_from_pretrained.
+        For evaluation, move model to GPU if available.
+        Checkpoint loading is handled in init_from_pretrained() during __init__.
+        This is called in each Ray worker, so we ensure GPU usage here.
         """
-        # Checkpoint loading is handled in init_from_pretrained() during __init__
-        # This method is kept for compatibility with AbstractAgent interface
-        pass
+        if torch.cuda.is_available():
+            print(f"CUDA is available in worker (device_count={torch.cuda.device_count()}). Moving model to GPU.")
+            self._transfuser_model = self._transfuser_model.to("cuda")
+            print(f"Model moved to GPU: cuda:{torch.cuda.current_device()}")
+            # Ensure all parameters and buffers are on GPU
+            self._transfuser_model = self._transfuser_model.cuda()
+        else:
+            print("CUDA not available in worker, using CPU for inference.")
+            self._transfuser_model = self._transfuser_model.to("cpu")
 
     def get_sensor_config(self) -> SensorConfig:
         """Inherited, see superclass."""
