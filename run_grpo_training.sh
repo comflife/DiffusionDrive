@@ -32,7 +32,7 @@ echo "  [Bug4] PPO importance ratio + clipping"
 echo "  [Bug5] std clamp + advantage clipping"
 echo ""
 echo "GRPO Settings v2:"
-echo "  - Data   : navtrain (harder/more diverse than navtest)"
+echo "  - Data   : navtest (matching metric cache)"
 echo "  - Group  : 8 rollouts/scene  (was 4 → too few for variance)"
 echo "  - Temp   : 1.0               (was 0.5 → too concentrated)"
 echo "  - KL coef: 0.01              (was 0.1 → was too restrictive)"
@@ -51,17 +51,17 @@ ln -s "$PRETRAINED_CKPT" "$SAFE_CKPT"
 
 # Run GRPO training
 # IMPORTANT changes vs v1:
-#   train_test_split=navtrain  (was navtest — test data is too easy → all rewards ~1.0)
+#   train_test_split=navtest  (matching metric cache)
 #   group_size=8               (was 4 → need more rollouts to get reward variance)
 #   temperature=1.0            (was 0.5 → too peaked, all rollouts similar)
 #   kl_coef=0.01               (was 0.1 → too high, blocks updates even with advantages)
 #   ++clip_eps=0.2             (new PPO clipping parameter)
 python3 -m navsim.agents.diffusiondrive.grpo_train \
-    train_test_split=navtrain \
+    train_test_split=navtest \
     ++checkpoint_path="$SAFE_CKPT" \
     ++metric_cache_path=/data2/byounggun/metric_cache \
-    navsim_log_path="$OPENSCENE_DATA_ROOT/navsim_logs/trainval" \
-    sensor_blobs_path="$OPENSCENE_DATA_ROOT/sensor_blobs/trainval" \
+    navsim_log_path="$OPENSCENE_DATA_ROOT/navsim_logs/test" \
+    sensor_blobs_path="$OPENSCENE_DATA_ROOT/sensor_blobs/test" \
     output_dir=/data2/byounggun/diffusiondrive_grpo_output_v2 \
     ++experiment_name=diffusiondrive_ar_grpo_v2 \
     ++trainer.params.max_epochs=20 \

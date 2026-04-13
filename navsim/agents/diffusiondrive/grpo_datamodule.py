@@ -121,7 +121,14 @@ class GRPODataModule(pl.LightningDataModule):
         """Setup datasets."""
         from hydra.utils import instantiate
         
+        # Debug: print train_test_split structure
+        print(f"DEBUG: train_test_split type: {type(self.train_test_split)}")
+        print(f"DEBUG: train_test_split keys: {list(self.train_test_split.keys()) if hasattr(self.train_test_split, 'keys') else 'N/A'}")
+        
         # Build scene filter (similar to run_training.py)
+        scene_filter_cfg = self.train_test_split.get('scene_filter', None)
+        print(f"DEBUG: scene_filter_cfg: {scene_filter_cfg}")
+        
         scene_filter: SceneFilter = instantiate(self.train_test_split.scene_filter)
         
         # Filter log_names based on train_logs if available
