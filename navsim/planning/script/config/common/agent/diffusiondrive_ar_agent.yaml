@@ -18,6 +18,7 @@ config:
   ego_vocab_path: /home/byounggun/DiffusionDrive/codebook_cache/navsim_kdisk_v512/ego.npy
   agent_topk: 8
   agent_context_dim: 256
+  temperature: 0.0  # default greedy; override with +agent.config.temperature=0.8 for stochastic sampling in AR head
 
 checkpoint_path: null
 lr: 6e-4

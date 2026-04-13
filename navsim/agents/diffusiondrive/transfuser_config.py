@@ -134,6 +134,7 @@ class TransfuserConfig:
     ego_vocab_path: str = ""   # Path to ego codebook .npy file
     agent_topk: int = 8        # Number of top agents to use as context
     agent_context_dim: int = 256  # Dimension for agent continuous feature encoding
+    temperature: float = 0.0   # Sampling temperature for AR decoding (0.0=greedy, >0=multinomial for diversity)
     # optimizer=dict(
     #     type="AdamW",
     #     lr=1e-4,
