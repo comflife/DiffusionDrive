@@ -1,8 +1,8 @@
-# DiffusionDrive AR Experiments
+# DiffusionDrive with Discrete Autoregressive Decoder
 
-This repository is currently organized around a discrete autoregressive planner built on top of the DiffusionDrive backbone.
+This repository implements a discrete autoregressive planner on top of the DiffusionDrive backbone.
 
-The original diffusion decoder is not the main training target here. The current workflow is:
+The original diffusion decoder is kept as a baseline, but the current main workflow replaces the trajectory head with a **discrete token-based autoregressive decoder**:
 
 1. Load the pretrained DiffusionDrive NAVSIM checkpoint.
 2. Freeze the pretrained trunk.
@@ -11,15 +11,16 @@ The original diffusion decoder is not the main training target here. The current
 
 ## What We Changed
 
-We maintain the original DiffusionDrive backbone, but the planning head has been replaced or extended with discrete autoregressive decoders.
+We maintain the original DiffusionDrive backbone, but the planning head has been replaced with discrete autoregressive decoders.
 
 ### Baseline AR
 
 The baseline AR model is a single-policy discrete autoregressive decoder.
 
 - `agent=diffusiondrive_ar_agent`
-- model file: [navsim/agents/diffusiondrive/transfuser_model_ar.py](/home/byounggun/DiffusionDrive/navsim/agents/diffusiondrive/transfuser_model_ar.py)
-- config file: [navsim/planning/script/config/common/agent/diffusiondrive_ar_agent.yaml](/home/byounggun/DiffusionDrive/navsim/planning/script/config/common/agent/diffusiondrive_ar_agent.yaml)
+- model file: [navsim/agents/diffusiondrive/transfuser_model_ar.py](navsim/agents/diffusiondrive/transfuser_model_ar.py)
+- agent file: [navsim/agents/diffusiondrive/transfuser_agent_ar.py](navsim/agents/diffusiondrive/transfuser_agent_ar.py)
+- config file: [navsim/planning/script/config/common/agent/diffusiondrive_ar_agent.yaml](navsim/planning/script/config/common/agent/diffusiondrive_ar_agent.yaml)
 
 Key properties:
 
@@ -38,9 +39,9 @@ Key properties:
 AR+ is a stronger discrete AR decoder variant intended to improve conditioning without bringing diffusion back into the planner.
 
 - `agent=diffusiondrive_ar_plus_agent`
-- model file: [navsim/agents/diffusiondrive/transfuser_model_ar_plus.py](/home/byounggun/DiffusionDrive/navsim/agents/diffusiondrive/transfuser_model_ar_plus.py)
-- agent file: [navsim/agents/diffusiondrive/transfuser_agent_ar_plus.py](/home/byounggun/DiffusionDrive/navsim/agents/diffusiondrive/transfuser_agent_ar_plus.py)
-- config file: [navsim/planning/script/config/common/agent/diffusiondrive_ar_plus_agent.yaml](/home/byounggun/DiffusionDrive/navsim/planning/script/config/common/agent/diffusiondrive_ar_plus_agent.yaml)
+- model file: [navsim/agents/diffusiondrive/transfuser_model_ar_plus.py](navsim/agents/diffusiondrive/transfuser_model_ar_plus.py)
+- agent file: [navsim/agents/diffusiondrive/transfuser_agent_ar_plus.py](navsim/agents/diffusiondrive/transfuser_agent_ar_plus.py)
+- config file: [navsim/planning/script/config/common/agent/diffusiondrive_ar_plus_agent.yaml](navsim/planning/script/config/common/agent/diffusiondrive_ar_plus_agent.yaml)
 
 Compared with baseline AR, AR+ adds:
 
@@ -51,11 +52,124 @@ Compared with baseline AR, AR+ adds:
 
 This is still a discrete autoregressive planner, not a diffusion planner.
 
+## Architecture
+
+The backbone (Transfuser) is frozen; only the Trajectory Head is replaced by a **Discrete Autoregressive Decoder**.
+
+```
+Camera / Lidar
+       │
+       ▼
+┌──────────────────────────────┐
+│  Transfuser Backbone         │
+│  (image/lidar encoder + BEV) │
+└──────────┬───────────────────┘
+           │
+           ▼
+┌──────────────────────────────────────────────┐
+│ Transformer Decoder                          │
+│  queries → [Trajectory Query, Agents Query]  │
+└──────────┬─────────────────┬─────────────────┘
+           │                 │
+           │          ┌──────┴──────┐
+           │          │  AgentHead  │
+           │          │(bbox+score) │
+           │          └──────┬──────┘
+           │                 │
+           ▼                 ▼
+┌─────────────────────────────────────────────────────────────┐
+│           Discrete Autoregressive Decoder                   │
+│         (RichDiscreteARTrajectoryHead)                      │
+│                                                             │
+│   ┌─────────────────────────────────────────────────────┐   │
+│   │  Input: BOS token + Rich Ego Context                │   │
+│   │         (ego + BEV summary + agent summary + status)│   │
+│   └────────────────────────┬────────────────────────────┘   │
+│                            │                                │
+│                            ▼                                │
+│   ┌─────────────────────────────────────────────────────┐   │
+│   │  For t = 0 ... T-1  (autoregressive)                │   │
+│   │                                                     │   │
+│   │   ┌─────────────┐                                   │   │
+│   │   │ Temporal    │  ← causal self-attention         │   │
+│   │   │ Self-Attn   │     (only attends 0..t)          │   │
+│   │   └──────┬──────┘                                   │   │
+│   │          │                                          │   │
+│   │          ▼                                          │   │
+│   │   ┌─────────────┐      agent features at t          │   │
+│   │   │ Ego-Agent   │  ←  [query + bbox state + score]  │   │
+│   │   │ Cross-Attn  │     with ego-conditioned gating   │   │
+│   │   └──────┬──────┘                                   │   │
+│   │          │                                          │   │
+│   │          ▼                                          │   │
+│   │   ┌─────────────┐      BEV grid features            │   │
+│   │   │ BEV         │  ←  cross-attention               │   │
+│   │   │ Cross-Attn  │                                   │   │
+│   │   └──────┬──────┘                                   │   │
+│   │          │                                          │   │
+│   │          ▼                                          │   │
+│   │   ┌─────────────┐                                   │   │
+│   │   │ FFN         │                                   │   │
+│   │   └──────┬──────┘                                   │   │
+│   │          │                                          │   │
+│   │          ▼                                          │   │
+│   │   [Token Logit_t] ──► argmax ──► token_t           │   │
+│   │          │                                          │   │
+│   │          └─────────────────────────────────────┐    │   │
+│   │                                                │    │   │
+│   │   token_t ──► embedding ──► input_{t+1}       │    │   │
+│   └────────────────────────────────────────────────┘    │   │
+│                            │                              │
+│                            ▼                              │
+│   ┌─────────────────────────────────────────────────────┐ │
+│   │  Output Construction                                │ │
+│   │                                                     │ │
+│   │   tokens ──► ego_codebook[tokens]   = token_deltas  │ │
+│   │            + ego_delta_head(hidden) = residuals     │ │
+│   │            ──────────────────────────────────────   │ │
+│   │            = final_deltas  ──► cumsum ──► (x, y)    │ │
+│   │                                                     │ │
+│   │   hidden ──► ego_heading_head()     = heading       │ │
+│   │                                                     │ │
+│   │            ──────────────────────────────────────   │ │
+│   │            = Final Trajectory (x, y, θ)             │ │
+│   └─────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Core Idea: Codebook Lookup + Residual Head
+
+The decoder's `ego_token_head` classifies a codebook index at each timestep:
+
+```python
+logits = self.ego_token_head(ego_q)   # [B, M, T, V]
+tokens = logits.argmax(-1)            # [B, M, T]
+```
+
+However, the token is **not used directly as coordinates**. Instead, a two-stage post-processing refines the trajectory:
+
+```python
+# 1. Codebook Lookup: base displacement for the token
+token_deltas = self.ego_codebook[tokens]          # [B, M, T, 2]
+
+# 2. Residual Head: fine adjustment predicted from hidden state
+residual_deltas = self.ego_delta_head(hidden)     # [B, M, T, 2]
+
+# 3. Sum and cumsum → absolute coordinates
+deltas_xy = token_deltas + residual_deltas
+pos_xy = deltas_xy.cumsum(dim=2)                  # [B, M, T, 2]
+
+# 4. Heading is predicted by a separate continuous head
+heading = self.ego_heading_head(hidden)           # [B, M, T, 1]
+```
+
+This creates a **coarse-to-fine** collaboration: the discrete token decides the coarse direction, and the residual head handles fine-grained correction.
+
 ## Base Checkpoint
 
 All AR experiments are initialized from the pretrained DiffusionDrive NAVSIM checkpoint:
 
-- `/home/byounggun/DiffusionDrive/diffusiondrive_navsim_88p1_PDMS`
+- `diffusiondrive_navsim_88p1_PDMS`
 
 This checkpoint is used to initialize the trunk. The AR head is newly initialized, and the pretrained trunk is frozen during AR training.
 
@@ -63,7 +177,7 @@ This checkpoint is used to initialize the trunk. The AR head is newly initialize
 
 The ego codebook currently used by the AR models is:
 
-- `/home/byounggun/DiffusionDrive/codebook_cache/navsim_kdisk_v512/ego.npy`
+- `codebook_cache/navsim_kdisk_v512/ego.npy`
 
 Current assumption:
 
@@ -72,18 +186,28 @@ Current assumption:
 
 The AR decoder predicts token sequences over this codebook and then reconstructs continuous trajectories with residual refinement.
 
+You can generate a new codebook with:
+
+```bash
+python navsim_create_codebook_diffusiondrive.py \
+    --data_path /path/to/navsim/logs/trainval \
+    --output codebook_cache/navsim_kdisk_v512/ego.npy \
+    --vocab_size 512 \
+    --n_trajs 100000 \
+    --tol_dist 0.05 \
+    --seed 42
+```
+
 ## Training
 
 ### 1. Baseline AR SFT
 
-Script:
-
-- [run_training_ar.sh](/home/byounggun/DiffusionDrive/run_training_ar.sh)
+Script: [run_training_ar.sh](run_training_ar.sh)
 
 Run:
 
 ```bash
-cd /home/byounggun/DiffusionDrive
+cd DiffusionDrive
 bash run_training_ar.sh
 ```
 
@@ -101,81 +225,48 @@ Current default settings:
 
 ### 2. AR+ SFT
 
-Script:
-
-- [run_training_ar_plus.sh](/home/byounggun/DiffusionDrive/run_training_ar_plus.sh)
+Script: [run_training_ar_plus.sh](run_training_ar_plus.sh)
 
 Run:
 
 ```bash
-cd /home/byounggun/DiffusionDrive
+cd DiffusionDrive
 bash run_training_ar_plus.sh
 ```
 
 This uses the same pretrained trunk and similar hyperparameters, but swaps the decoder to AR+.
 
-### 3. Decoder Tuning From a Trained Baseline AR Checkpoint
-
-Script:
-
-- [run_training_ar_from_base.sh](/home/byounggun/DiffusionDrive/run_training_ar_from_base.sh)
-
-Run:
-
-```bash
-cd /home/byounggun/DiffusionDrive
-bash run_training_ar_from_base.sh
-```
-
-This starts from the trained baseline AR checkpoint:
-
-- `/data2/byounggun/diffusiondrive_ar_output/diffusiondrive-ar/24l0pgz4/checkpoints/last.ckpt`
-
-and continues tuning the AR decoder while keeping the trunk frozen.
-
 ## Evaluation
 
 ### Baseline AR Evaluation
 
-Script:
-
-- [run_eval_ar_base_latest.sh](/home/byounggun/DiffusionDrive/run_eval_ar_base_latest.sh)
+Script: [run_eval_ar_base_latest.sh](run_eval_ar_base_latest.sh)
 
 Run:
 
 ```bash
-cd /home/byounggun/DiffusionDrive
+cd DiffusionDrive
 bash run_eval_ar_base_latest.sh
 ```
 
-Current evaluated checkpoint:
+Current evaluated checkpoint (edit the script to match your path):
 
-- `/data2/byounggun/diffusiondrive_ar_output/diffusiondrive-ar/24l0pgz4/checkpoints/last.ckpt`
+- `/path/to/diffusiondrive-ar/checkpoints/last.ckpt`
 
 ### AR+ Evaluation
 
-Script:
-
-- [run_eval_ar_plus_latest.sh](/home/byounggun/DiffusionDrive/run_eval_ar_plus_latest.sh)
+Script: [run_eval_ar_plus_latest.sh](run_eval_ar_plus_latest.sh)
 
 Run:
 
 ```bash
-cd /home/byounggun/DiffusionDrive
+cd DiffusionDrive
 bash run_eval_ar_plus_latest.sh
 ```
 
-Current evaluated checkpoint:
+Current evaluated checkpoint (edit the script to match your path):
 
-- `/data2/byounggun/diffusiondrive_ar_output/diffusiondrive-ar/77qd0ttw/checkpoints/last.ckpt`
-
-### Stochastic AR Evaluation
-
-Script:
-
-- [run_eval_ar_temperature.sh](/home/byounggun/DiffusionDrive/run_eval_ar_temperature.sh)
-
-This is useful when checking how stochastic sampling changes AR behavior under a nonzero decoding temperature.
+- `/path/to/diffusiondrive-ar-plus/checkpoints/last.ckpt`
 
 ## GRPO Fine-Tuning
 
@@ -183,21 +274,18 @@ After SFT, the baseline AR model can be further tuned with GRPO using PDMS as th
 
 ### GRPO Setup
 
-Script:
-
-- [run_grpo_training_base_t08.sh](/home/byounggun/DiffusionDrive/run_grpo_training_base_t08.sh)
+Script: [run_grpo_training_base_t08.sh](run_grpo_training_base_t08.sh)
 
 Run:
 
 ```bash
-cd /home/byounggun/DiffusionDrive
+cd DiffusionDrive
 bash run_grpo_training_base_t08.sh
 ```
 
-Current GRPO setup:
+Current GRPO setup (edit the script to match your checkpoint path):
 
-- base checkpoint:
-  `/data2/byounggun/diffusiondrive_ar_output/diffusiondrive-ar/24l0pgz4/checkpoints/last.ckpt`
+- base checkpoint: `/path/to/diffusiondrive-ar/checkpoints/last.ckpt`
 - train split for GRPO rollouts: `navtest`
 - reward: PDMS
 - group size: `16`
@@ -215,36 +303,34 @@ Implementation notes:
 
 ### GRPO Evaluation
 
-Script:
-
-- [run_eval_grpo_base_t08.sh](/home/byounggun/DiffusionDrive/run_eval_grpo_base_t08.sh)
+Script: [run_eval_grpo_base_t08.sh](run_eval_grpo_base_t08.sh)
 
 Run:
 
 ```bash
-cd /home/byounggun/DiffusionDrive
+cd DiffusionDrive
 bash run_eval_grpo_base_t08.sh
 ```
 
-Current evaluated checkpoint:
+Current evaluated checkpoint (edit the script to match your path):
 
-- `/data2/byounggun/diffusiondrive_grpo_output_base_t08/checkpoints/last.ckpt`
+- `/path/to/diffusiondrive_grpo_output/checkpoints/last.ckpt`
 
 Output directory:
 
-- `/data2/byounggun/diffusiondrive_grpo_output_base_t08/eval_latest`
+- `/path/to/diffusiondrive_grpo_output/eval_latest`
 
 ## Main Files
 
 Core files for the current AR workflow:
 
-- [navsim/agents/diffusiondrive/transfuser_config.py](/home/byounggun/DiffusionDrive/navsim/agents/diffusiondrive/transfuser_config.py)
-- [navsim/agents/diffusiondrive/transfuser_model_ar.py](/home/byounggun/DiffusionDrive/navsim/agents/diffusiondrive/transfuser_model_ar.py)
-- [navsim/agents/diffusiondrive/transfuser_agent_ar.py](/home/byounggun/DiffusionDrive/navsim/agents/diffusiondrive/transfuser_agent_ar.py)
-- [navsim/agents/diffusiondrive/transfuser_model_ar_plus.py](/home/byounggun/DiffusionDrive/navsim/agents/diffusiondrive/transfuser_model_ar_plus.py)
-- [navsim/agents/diffusiondrive/transfuser_agent_ar_plus.py](/home/byounggun/DiffusionDrive/navsim/agents/diffusiondrive/transfuser_agent_ar_plus.py)
-- [navsim/agents/diffusiondrive/grpo_trainer.py](/home/byounggun/DiffusionDrive/navsim/agents/diffusiondrive/grpo_trainer.py)
-- [navsim/agents/diffusiondrive/grpo_train.py](/home/byounggun/DiffusionDrive/navsim/agents/diffusiondrive/grpo_train.py)
+- [navsim/agents/diffusiondrive/transfuser_config.py](navsim/agents/diffusiondrive/transfuser_config.py)
+- [navsim/agents/diffusiondrive/transfuser_model_ar.py](navsim/agents/diffusiondrive/transfuser_model_ar.py)
+- [navsim/agents/diffusiondrive/transfuser_agent_ar.py](navsim/agents/diffusiondrive/transfuser_agent_ar.py)
+- [navsim/agents/diffusiondrive/transfuser_model_ar_plus.py](navsim/agents/diffusiondrive/transfuser_model_ar_plus.py)
+- [navsim/agents/diffusiondrive/transfuser_agent_ar_plus.py](navsim/agents/diffusiondrive/transfuser_agent_ar_plus.py)
+- [navsim/agents/diffusiondrive/grpo_trainer.py](navsim/agents/diffusiondrive/grpo_trainer.py)
+- [navsim/agents/diffusiondrive/grpo_train.py](navsim/agents/diffusiondrive/grpo_train.py)
 
 ## Notes
 
