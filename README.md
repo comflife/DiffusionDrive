@@ -1,114 +1,253 @@
-<div align="center">
-<img src="assets/logo.png" width="80">
-<h1>DiffusionDrive</h1>
-<h3>Truncated Diffusion Model for End-to-End Autonomous Driving</h3>
+# DiffusionDrive AR Experiments
 
-[Bencheng Liao](https://github.com/LegendBC)<sup>1,2</sup>, [Shaoyu Chen](https://scholar.google.com/citations?user=PIeNN2gAAAAJ&hl=en&oi=sra)<sup>2,3</sup>, Haoran Yin<sup>3</sup>, [Bo Jiang](https://scholar.google.com/citations?user=UlDxGP0AAAAJ&hl=en)<sup>2</sup>, [Cheng Wang](https://scholar.google.com/citations?user=PdJIyPIAAAAJ&hl=zh-CN)<sup>1,2</sup>, [Sixu Yan](https://sixu-yan.github.io/)<sup>2</sup>, Xinbang Zhang<sup>3</sup>, Xiangyu Li<sup>3</sup>, Ying Zhang<sup>3</sup>, [Qian Zhang](https://scholar.google.com/citations?user=pCY-bikAAAAJ&hl=zh-CN)<sup>3</sup>, [Xinggang Wang](https://xwcv.github.io)<sup>2 :email:</sup>
- 
-<sup>1</sup> Institute of Artificial Intelligence, HUST, <sup>2</sup> School of EIC, HUST, <sup>3</sup> Horizon Robotics
+This repository is currently organized around a discrete autoregressive planner built on top of the DiffusionDrive backbone.
 
-(<sup>:email:</sup>) corresponding author, xgwang@hust.edu.cn
+The original diffusion decoder is not the main training target here. The current workflow is:
 
-Accepted to CVPR 2025 as Highlight!
+1. Load the pretrained DiffusionDrive NAVSIM checkpoint.
+2. Freeze the pretrained trunk.
+3. Train a discrete autoregressive decoder with supervised fine-tuning.
+4. Optionally continue with GRPO using PDMS as the reward.
 
-[![DiffusionDrive](https://img.shields.io/badge/Paper-DiffusionDrive-2b9348.svg?logo=arXiv)](https://arxiv.org/abs/2411.15139)&nbsp;
-[![huggingface weights](https://img.shields.io/badge/%F0%9F%A4%97%20Weights-DiffusionDrive-yellow)](https://huggingface.co/hustvl/DiffusionDrive)&nbsp;
+## What We Changed
 
+We maintain the original DiffusionDrive backbone, but the planning head has been replaced or extended with discrete autoregressive decoders.
 
+### Baseline AR
 
-</div>
+The baseline AR model is a single-policy discrete autoregressive decoder.
 
-## News
-* **` Apr. 4th, 2025`:** DiffusionDrive is awarded as CVPR 2025 Highlight!
-* **` Feb. 27th, 2025`:** DiffusionDrive is accepted to CVPR 2025!
-* **` Jan. 18th, 2025`:** We release the initial version of code and weight on nuScenes, along with documentation and training/evaluation scripts. Please run `git checkout nusc` to use it.
-* **` Dec. 16th, 2024`:** We release the initial version of code and weight on NAVSIM, along with documentation and training/evaluation scripts.
-* **` Nov. 25th, 2024`:** We released our paper on [Arxiv](https://arxiv.org/abs/2411.15139). Code/Models are coming soon. Please stay tuned! ☕️
+- `agent=diffusiondrive_ar_agent`
+- model file: [navsim/agents/diffusiondrive/transfuser_model_ar.py](/home/byounggun/DiffusionDrive/navsim/agents/diffusiondrive/transfuser_model_ar.py)
+- config file: [navsim/planning/script/config/common/agent/diffusiondrive_ar_agent.yaml](/home/byounggun/DiffusionDrive/navsim/planning/script/config/common/agent/diffusiondrive_ar_agent.yaml)
 
+Key properties:
 
-## Table of Contents
-- [Introduction](#introduction)
-- [Qualitative Results on NAVSIM Navtest Split](#qualitative-results-on-navsim-navtest-split)
-- [Video Demo on Real-world Application](#video-demo-on-real-world-application)
-- [Getting Started](#getting-started)
-- [Contact](#contact)
-- [Acknowledgement](#acknowledgement)
-- [Citation](#citation)
+- single-mode AR policy: `ar_num_modes=1`
+- ego action space is a discrete codebook loaded from `codebook_cache/navsim_kdisk_v512/ego.npy`
+- token prediction is autoregressive
+- training uses teacher forcing only for SFT next-token prediction
+- trajectory reconstruction is not token-only:
+  token coarse motion is refined by residual continuous heads
+- training loss is:
+  token cross-entropy + trajectory SmoothL1 + heading SmoothL1
+- pretrained trunk is frozen and only the AR trajectory head is updated
 
-## Introduction
-Diffusion policy exhibits promising multimodal property and distributional expressivity in robotic field, while not ready for real-time end-to-end autonomous driving in more dynamic and open-world traffic scenes. To bridge this gap, we propose a novel truncated diffusion model, DiffusionDrive, for real-time end-to-end autonomous driving, which is much faster (10x reduction in diffusion denoising steps), more accurate (3.5 higher PDMS on NAVSIM), and more diverse (64% higher mode diversity score) than the vanilla diffusion policy. Without bells and whistles, DiffusionDrive achieves record-breaking 88.1 PDMS on NAVSIM benchmark with the same ResNet-34 backbone by directly learning from human demonstrations, while running at a real-time speed of 45 FPS.
+### AR+
 
-<div align="center"><b>Truncated Diffusion Policy.</b>
-<img src="assets/truncated_diffusion_policy.png" />
-<b>Pipeline of DiffusionDrive. DiffusionDrive is highly flexible to integrate with onboard sensor data and existing perception modules.</b>
-<img src="assets/pipeline.png" />
-</div>
+AR+ is a stronger discrete AR decoder variant intended to improve conditioning without bringing diffusion back into the planner.
 
-## Qualitative Results on NAVSIM Navtest Split
-<div align="center">
-<b>Going straight with car-following and lane-changing behaviors.</b>
-<img src="assets/straight_0.png" />
-<b>Going straight with diverse lane-changing behavior, which interacts with traffic light and stops at the stop line.</b>
-<img src="assets/straight_1.png" />
-<b>Turning left with diverse lane-changing behavior, which interacts with surrounding agents.</b>
-<img src="assets/left_0.png" />
-<b>Turning right with car-following and overtaking behaviors.</b>
-<img src="assets/right_0.png" />
-</div>
+- `agent=diffusiondrive_ar_plus_agent`
+- model file: [navsim/agents/diffusiondrive/transfuser_model_ar_plus.py](/home/byounggun/DiffusionDrive/navsim/agents/diffusiondrive/transfuser_model_ar_plus.py)
+- agent file: [navsim/agents/diffusiondrive/transfuser_agent_ar_plus.py](/home/byounggun/DiffusionDrive/navsim/agents/diffusiondrive/transfuser_agent_ar_plus.py)
+- config file: [navsim/planning/script/config/common/agent/diffusiondrive_ar_plus_agent.yaml](/home/byounggun/DiffusionDrive/navsim/planning/script/config/common/agent/diffusiondrive_ar_plus_agent.yaml)
 
-## Video Demo on Real-world Application
+Compared with baseline AR, AR+ adds:
 
+- richer BOS construction from ego query, BEV summary, agent summary, and status encoding
+- stronger agent-state-aware conditioning
+- step-aware agent context instead of simple static repetition
+- ego-conditioned gating over agent context
 
-https://github.com/user-attachments/assets/bd2364f3-73fd-4c29-b8b2-ead11f78926d
+This is still a discrete autoregressive planner, not a diffusion planner.
 
+## Base Checkpoint
 
+All AR experiments are initialized from the pretrained DiffusionDrive NAVSIM checkpoint:
 
+- `/home/byounggun/DiffusionDrive/diffusiondrive_navsim_88p1_PDMS`
 
+This checkpoint is used to initialize the trunk. The AR head is newly initialized, and the pretrained trunk is frozen during AR training.
 
-## Getting Started
+## Codebook
 
-- [Getting started from NAVSIM environment preparation](https://github.com/autonomousvision/navsim?tab=readme-ov-file#getting-started-)
-- [Preparation of DiffusionDrive environment](docs/install.md)
-- [Training and Evaluation](docs/train_eval.md)
+The ego codebook currently used by the AR models is:
 
+- `/home/byounggun/DiffusionDrive/codebook_cache/navsim_kdisk_v512/ego.npy`
 
-## Checkpoint
+Current assumption:
 
-> Results on NAVSIM
+- shape is effectively `[512, 2]`
+- each token represents a single-step local displacement primitive
 
+The AR decoder predicts token sequences over this codebook and then reconstructs continuous trajectories with residual refinement.
 
-| Method | Model Size | Backbone | PDMS | Weight Download |
-| :---: | :---: | :---: | :---:  | :---: |
-| DiffusionDrive | 60M | [ResNet-34](https://huggingface.co/timm/resnet34.a1_in1k) | [88.1](https://github.com/hustvl/DiffusionDrive/releases/download/DiffusionDrive_88p1_PDMS_Eval_file/diffusiondrive_88p1_PDMS.csv) | [Hugging Face](https://huggingface.co/hustvl/DiffusionDrive) |
+## Training
 
-> Results on nuScenes
+### 1. Baseline AR SFT
 
+Script:
 
-| Method | Backbone | Weight | Log | L2 (m) 1s | L2 (m) 2s | L2 (m) 3s | L2 (m) Avg | Col. (%) 1s | Col. (%) 2s | Col. (%) 3s | Col. (%) Avg |
-| :---: | :---: | :---: | :---: | :---: | :---: | :---:| :---: | :---: | :---: | :---: | :---: |
-| DiffusionDrive | ResNet-50 | [HF](https://huggingface.co/hustvl/DiffusionDrive) | [Github](https://github.com/hustvl/DiffusionDrive/releases/download/DiffusionDrive_nuScenes/diffusiondrive_stage2.log.log) |  0.27 | 0.54  | 0.90 |0.57 | 0.03  | 0.05 | 0.16 | 0.08  |
+- [run_training_ar.sh](/home/byounggun/DiffusionDrive/run_training_ar.sh)
 
+Run:
 
-
-## Contact
-If you have any questions, please contact [Bencheng Liao](https://github.com/LegendBC) via email (bcliao@hust.edu.cn).
-
-## Acknowledgement
-DiffusionDrive is greatly inspired by the following outstanding contributions to the open-source community: [NAVSIM](https://github.com/autonomousvision/navsim), [Transfuser](https://github.com/autonomousvision/transfuser), [Diffusion Policy](https://github.com/real-stanford/diffusion_policy), [MapTR](https://github.com/hustvl/MapTR), [VAD](https://github.com/hustvl/VAD), [SparseDrive](https://github.com/swc-17/SparseDrive).
-
-## Citation
-If you find DiffusionDrive is useful in your research or applications, please consider giving us a star 🌟 and citing it by the following BibTeX entry.
-
-```bibtex
- @article{diffusiondrive,
-  title={DiffusionDrive: Truncated Diffusion Model for End-to-End Autonomous Driving},
-  author={Bencheng Liao and Shaoyu Chen and Haoran Yin and Bo Jiang and Cheng Wang and Sixu Yan and Xinbang Zhang and Xiangyu Li and Ying Zhang and Qian Zhang and Xinggang Wang},
-  booktitle    = {{IEEE/CVF} Conference on Computer Vision and Pattern Recognition,
-                  {CVPR} 2025, Nashville, TN, USA, June 11-15, 2025},
-  pages        = {12037--12047},
-  publisher    = {Computer Vision Foundation / {IEEE}},
-  year         = {2025},
-  url          = {https://openaccess.thecvf.com/content/CVPR2025/html/Liao\_DiffusionDrive\_Truncated\_Diffusion\_Model\_for\_End-to-End\_Autonomous\_Driving\_CVPR\_2025\_paper.html},
-  doi          = {10.1109/CVPR52734.2025.01124}
-}
+```bash
+cd /home/byounggun/DiffusionDrive
+bash run_training_ar.sh
 ```
+
+Current default settings:
+
+- pretrained checkpoint: `diffusiondrive_navsim_88p1_PDMS`
+- trunk freeze: `true`
+- batch size: `64` per GPU
+- devices: `4`
+- learning rate: `2e-4`
+- loss weights:
+  - token: `1.0`
+  - trajectory: `8.0`
+  - heading: `2.0`
+
+### 2. AR+ SFT
+
+Script:
+
+- [run_training_ar_plus.sh](/home/byounggun/DiffusionDrive/run_training_ar_plus.sh)
+
+Run:
+
+```bash
+cd /home/byounggun/DiffusionDrive
+bash run_training_ar_plus.sh
+```
+
+This uses the same pretrained trunk and similar hyperparameters, but swaps the decoder to AR+.
+
+### 3. Decoder Tuning From a Trained Baseline AR Checkpoint
+
+Script:
+
+- [run_training_ar_from_base.sh](/home/byounggun/DiffusionDrive/run_training_ar_from_base.sh)
+
+Run:
+
+```bash
+cd /home/byounggun/DiffusionDrive
+bash run_training_ar_from_base.sh
+```
+
+This starts from the trained baseline AR checkpoint:
+
+- `/data2/byounggun/diffusiondrive_ar_output/diffusiondrive-ar/24l0pgz4/checkpoints/last.ckpt`
+
+and continues tuning the AR decoder while keeping the trunk frozen.
+
+## Evaluation
+
+### Baseline AR Evaluation
+
+Script:
+
+- [run_eval_ar_base_latest.sh](/home/byounggun/DiffusionDrive/run_eval_ar_base_latest.sh)
+
+Run:
+
+```bash
+cd /home/byounggun/DiffusionDrive
+bash run_eval_ar_base_latest.sh
+```
+
+Current evaluated checkpoint:
+
+- `/data2/byounggun/diffusiondrive_ar_output/diffusiondrive-ar/24l0pgz4/checkpoints/last.ckpt`
+
+### AR+ Evaluation
+
+Script:
+
+- [run_eval_ar_plus_latest.sh](/home/byounggun/DiffusionDrive/run_eval_ar_plus_latest.sh)
+
+Run:
+
+```bash
+cd /home/byounggun/DiffusionDrive
+bash run_eval_ar_plus_latest.sh
+```
+
+Current evaluated checkpoint:
+
+- `/data2/byounggun/diffusiondrive_ar_output/diffusiondrive-ar/77qd0ttw/checkpoints/last.ckpt`
+
+### Stochastic AR Evaluation
+
+Script:
+
+- [run_eval_ar_temperature.sh](/home/byounggun/DiffusionDrive/run_eval_ar_temperature.sh)
+
+This is useful when checking how stochastic sampling changes AR behavior under a nonzero decoding temperature.
+
+## GRPO Fine-Tuning
+
+After SFT, the baseline AR model can be further tuned with GRPO using PDMS as the reward.
+
+### GRPO Setup
+
+Script:
+
+- [run_grpo_training_base_t08.sh](/home/byounggun/DiffusionDrive/run_grpo_training_base_t08.sh)
+
+Run:
+
+```bash
+cd /home/byounggun/DiffusionDrive
+bash run_grpo_training_base_t08.sh
+```
+
+Current GRPO setup:
+
+- base checkpoint:
+  `/data2/byounggun/diffusiondrive_ar_output/diffusiondrive-ar/24l0pgz4/checkpoints/last.ckpt`
+- train split for GRPO rollouts: `navtest`
+- reward: PDMS
+- group size: `16`
+- sampling temperature: `0.8`
+- KL coefficient: `0.1`
+- PPO clip epsilon: `0.2`
+- learning rate: `1e-6`
+
+Implementation notes:
+
+- rollout generation is autoregressive sampling, not GT teacher forcing
+- token log-probs are recomputed teacher-forced on sampled trajectories for PPO/GRPO loss
+- reward is sequence-level PDMS
+- reference KL is computed from the token distributions
+
+### GRPO Evaluation
+
+Script:
+
+- [run_eval_grpo_base_t08.sh](/home/byounggun/DiffusionDrive/run_eval_grpo_base_t08.sh)
+
+Run:
+
+```bash
+cd /home/byounggun/DiffusionDrive
+bash run_eval_grpo_base_t08.sh
+```
+
+Current evaluated checkpoint:
+
+- `/data2/byounggun/diffusiondrive_grpo_output_base_t08/checkpoints/last.ckpt`
+
+Output directory:
+
+- `/data2/byounggun/diffusiondrive_grpo_output_base_t08/eval_latest`
+
+## Main Files
+
+Core files for the current AR workflow:
+
+- [navsim/agents/diffusiondrive/transfuser_config.py](/home/byounggun/DiffusionDrive/navsim/agents/diffusiondrive/transfuser_config.py)
+- [navsim/agents/diffusiondrive/transfuser_model_ar.py](/home/byounggun/DiffusionDrive/navsim/agents/diffusiondrive/transfuser_model_ar.py)
+- [navsim/agents/diffusiondrive/transfuser_agent_ar.py](/home/byounggun/DiffusionDrive/navsim/agents/diffusiondrive/transfuser_agent_ar.py)
+- [navsim/agents/diffusiondrive/transfuser_model_ar_plus.py](/home/byounggun/DiffusionDrive/navsim/agents/diffusiondrive/transfuser_model_ar_plus.py)
+- [navsim/agents/diffusiondrive/transfuser_agent_ar_plus.py](/home/byounggun/DiffusionDrive/navsim/agents/diffusiondrive/transfuser_agent_ar_plus.py)
+- [navsim/agents/diffusiondrive/grpo_trainer.py](/home/byounggun/DiffusionDrive/navsim/agents/diffusiondrive/grpo_trainer.py)
+- [navsim/agents/diffusiondrive/grpo_train.py](/home/byounggun/DiffusionDrive/navsim/agents/diffusiondrive/grpo_train.py)
+
+## Notes
+
+- The repository still contains the original DiffusionDrive codebase, but this README documents the current discrete AR training flow we are actively using.
+- Baseline AR and AR+ are intentionally separated into different agents and scripts for clean experiment tracking.
+- GRPO is currently wired to the baseline AR model path. If AR+ becomes the preferred SFT model, the GRPO trainer should be connected to AR+ explicitly.
