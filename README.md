@@ -38,6 +38,21 @@ So yes, this is a discrete autoregressive decoder. The planning decision itself 
 | Main goal | Stable discrete AR baseline | Stronger conditioning without diffusion |
 | Main files | `transfuser_model_ar.py`, `transfuser_agent_ar.py` | `transfuser_model_ar_plus.py`, `transfuser_agent_ar_plus.py` |
 
+## Current Results
+
+The following scores are from the current NAVSIM evaluation runs for the two discrete AR variants.
+
+| Metric | Baseline AR | AR+ |
+| --- | ---: | ---: |
+| NC | 98.1352 | 98.1846 |
+| DAC | 95.3153 | 95.4965 |
+| TTC | 94.5414 | 94.6402 |
+| Comf. | 99.9424 | 99.9424 |
+| EP | 81.4239 | 81.5735 |
+| PDMS | 87.1281 | 87.3599 |
+
+At the moment, AR+ is slightly better than the baseline AR on every reported metric except comfort, where they are tied.
+
 ### Baseline AR
 
 The baseline AR model is a single-policy discrete autoregressive decoder.
