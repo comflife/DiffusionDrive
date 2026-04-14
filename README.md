@@ -13,6 +13,31 @@ The original diffusion decoder is kept as a baseline, but the current main workf
 
 We maintain the original DiffusionDrive backbone, but the planning head has been replaced with discrete autoregressive decoders.
 
+At a high level, the planner now behaves more like a sequence model over motion primitives than a direct continuous trajectory regressor.
+
+The important distinction is:
+
+- the policy predicts **discrete token IDs**
+- the token sequence is generated **autoregressively**
+- the final reported trajectory is a **continuous refinement** of that token sequence
+
+So yes, this is a discrete autoregressive decoder. The planning decision itself lives in token space, but the final `(x, y, heading)` trajectory is reconstructed from those tokens with additional continuous refinement heads.
+
+## Baseline AR vs AR+
+
+| Item | Baseline AR | AR+ |
+| --- | --- | --- |
+| Agent name | `diffusiondrive_ar_agent` | `diffusiondrive_ar_plus_agent` |
+| Core planner type | Single-policy discrete AR | Single-policy discrete AR |
+| Token space | Ego codebook tokens | Ego codebook tokens |
+| Final output | Token-based plan + continuous refinement | Token-based plan + continuous refinement |
+| BOS | Ego-centered BOS | Rich BOS from ego + BEV + agent summary + status |
+| Agent conditioning | Basic top-k agent context | Stronger agent-state-aware context |
+| Time dependency in agent context | Simpler repeated agent context | Step-aware agent context |
+| Agent usage during decoding | Cross-attention | Cross-attention + ego-conditioned gating |
+| Main goal | Stable discrete AR baseline | Stronger conditioning without diffusion |
+| Main files | `transfuser_model_ar.py`, `transfuser_agent_ar.py` | `transfuser_model_ar_plus.py`, `transfuser_agent_ar_plus.py` |
+
 ### Baseline AR
 
 The baseline AR model is a single-policy discrete autoregressive decoder.
@@ -139,6 +164,23 @@ Camera / Lidar
 
 ### Core Idea: Codebook Lookup + Residual Head
 
+This is the easiest way to think about the current planner:
+
+1. The decoder predicts a motion token at each future step.
+2. Each token maps to a coarse motion primitive in the ego codebook.
+3. The decoder hidden state predicts a small residual correction on top of that primitive.
+4. A separate head predicts heading.
+5. The corrected per-step motions are accumulated into the final trajectory.
+
+So the final output is not "raw coordinates directly from a regression head", and it is also not "token lookup only".
+
+It is:
+
+- discrete motion planning first
+- continuous geometric refinement second
+
+That design keeps the planner token-based, while avoiding the large quantization error of a pure token-only rollout.
+
 The decoder's `ego_token_head` classifies a codebook index at each timestep:
 
 ```python
@@ -165,6 +207,15 @@ heading = self.ego_heading_head(hidden)           # [B, M, T, 1]
 
 This creates a **coarse-to-fine** collaboration: the discrete token decides the coarse direction, and the residual head handles fine-grained correction.
 
+Another way to read this is:
+
+- token sequence = the planner's motion language
+- codebook lookup = convert that language into coarse step motions
+- residual head = fix the parts the finite codebook cannot represent precisely
+- heading head = make the final trajectory orientation-aware
+
+This is why the model is still a discrete AR planner even though the final trajectory is continuous.
+
 ## Base Checkpoint
 
 All AR experiments are initialized from the pretrained DiffusionDrive NAVSIM checkpoint:
@@ -185,6 +236,14 @@ Current assumption:
 - each token represents a single-step local displacement primitive
 
 The AR decoder predicts token sequences over this codebook and then reconstructs continuous trajectories with residual refinement.
+
+Example intuition:
+
+- one token may correspond to "small forward step"
+- another may correspond to "forward plus slight left offset"
+- another may correspond to "shorter curved step"
+
+The exact vectors are learned by the codebook creation process, but conceptually they behave like a vocabulary of local motion primitives.
 
 You can generate a new codebook with:
 
