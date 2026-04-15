@@ -139,6 +139,8 @@ class TransfuserConfig:
     ar_token_loss_weight: float = 1.0
     ar_traj_loss_weight: float = 8.0
     ar_heading_loss_weight: float = 2.0
+    ar_use_residual_delta: bool = True
+    ar_use_heading_head: bool = True
     freeze_pretrained_trunk: bool = True
     # optimizer=dict(
     #     type="AdamW",

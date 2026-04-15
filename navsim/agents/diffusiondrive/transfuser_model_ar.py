@@ -90,6 +90,8 @@ class DiscreteARTrajectoryHead(nn.Module):
         self.token_loss_weight = getattr(config, 'ar_token_loss_weight', 1.0)
         self.traj_loss_weight = getattr(config, 'ar_traj_loss_weight', 8.0)
         self.heading_loss_weight = getattr(config, 'ar_heading_loss_weight', 2.0)
+        self.use_residual_delta = getattr(config, 'ar_use_residual_delta', True)
+        self.use_heading_head = getattr(config, 'ar_use_heading_head', True)
 
         # Ego vocabulary
         self.ego_vocab_size = getattr(config, 'ego_vocab_size', 512)
@@ -179,6 +181,7 @@ class DiscreteARTrajectoryHead(nn.Module):
         )
 
         self._init_weights()
+        self._configure_optional_heads()
 
     # ------------------------------------------------------------------
     # Initialisation
@@ -219,6 +222,14 @@ class DiscreteARTrajectoryHead(nn.Module):
                     nn.init.xavier_uniform_(module.weight)
                     nn.init.zeros_(module.bias)
 
+    def _configure_optional_heads(self):
+        if not self.use_residual_delta:
+            for param in self.ego_delta_head.parameters():
+                param.requires_grad = False
+        if not self.use_heading_head:
+            for param in self.ego_heading_head.parameters():
+                param.requires_grad = False
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
@@ -233,10 +244,17 @@ class DiscreteARTrajectoryHead(nn.Module):
     ) -> torch.Tensor:
         """Decode discrete tokens plus learned residuals into poses."""
         token_deltas = self.ego_codebook[tokens]          # [B, M, T, 2]
-        residual_deltas = self.ego_delta_head(hidden)     # [B, M, T, 2]
+        if self.use_residual_delta:
+            residual_deltas = self.ego_delta_head(hidden)     # [B, M, T, 2]
+        else:
+            residual_deltas = torch.zeros_like(token_deltas)
         deltas_xy = token_deltas + residual_deltas
         pos_xy = deltas_xy.cumsum(dim=2)
-        heading = self.ego_heading_head(hidden)
+
+        if self.use_heading_head:
+            heading = self.ego_heading_head(hidden)
+        else:
+            heading = torch.atan2(deltas_xy[..., 1], deltas_xy[..., 0]).unsqueeze(-1)
         return torch.cat([pos_xy, heading], dim=-1)
 
     def select_topk_agents(
