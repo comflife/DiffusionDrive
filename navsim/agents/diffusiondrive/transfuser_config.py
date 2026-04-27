@@ -141,6 +141,9 @@ class TransfuserConfig:
     ar_heading_loss_weight: float = 2.0
     ar_use_residual_delta: bool = True
     ar_use_heading_head: bool = True
+    ar_codebook_mode: str = "step_delta"  # step_delta, step_corners, or trajectory_corners
+    ar_match_heading_weight: float = 1.0
+    ar_teacher_forcing: bool = True
     freeze_pretrained_trunk: bool = True
     # optimizer=dict(
     #     type="AdamW",

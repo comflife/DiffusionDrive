@@ -1,4 +1,4 @@
-_target_: navsim.agents.diffusiondrive.transfuser_agent_ar.TransfuserAgentAR
+_target_: navsim.agents.diffusiondrive.transfuser_agent_ar_plus.TransfuserAgentARPlus
 _convert_: 'all'
 
 config:
@@ -12,13 +12,12 @@ config:
     interval_length: 0.5
 
   latent: False
-  
-  # Discrete AR specific configurations
+
   ego_vocab_size: 512
   ego_vocab_path: /home/byounggun/DiffusionDrive/codebook_cache/navsim_kdisk_v512/ego.npy
   agent_topk: 8
   agent_context_dim: 256
-  temperature: 0.0  # default greedy; override with +agent.config.temperature=0.8 for stochastic sampling in AR head
+  temperature: 0.0
   ar_num_modes: 1
   ar_token_loss_weight: 1.0
   ar_traj_loss_weight: 8.0

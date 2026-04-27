@@ -92,6 +92,9 @@ class DiscreteARTrajectoryHead(nn.Module):
         self.heading_loss_weight = getattr(config, 'ar_heading_loss_weight', 2.0)
         self.use_residual_delta = getattr(config, 'ar_use_residual_delta', True)
         self.use_heading_head = getattr(config, 'ar_use_heading_head', True)
+        self.codebook_mode = getattr(config, 'ar_codebook_mode', 'step_delta')
+        self.match_heading_weight = getattr(config, 'ar_match_heading_weight', 1.0)
+        self.teacher_forcing = getattr(config, 'ar_teacher_forcing', True)
 
         # Ego vocabulary
         self.ego_vocab_size = getattr(config, 'ego_vocab_size', 512)
@@ -193,17 +196,53 @@ class DiscreteARTrajectoryHead(nn.Module):
 
         if self.ego_vocab_path and os.path.isfile(self.ego_vocab_path):
             arr = np.load(self.ego_vocab_path).astype(np.float32)
-            # Codebook shape: [V, T, 3] or [V, T, 2] or [V, 2]
-            if arr.ndim == 3:
-                # [V, T, 3] → [V, T, 2] (ignore heading for token prediction)
-                ego_cb = torch.from_numpy(arr[:, :, :2])
+            # Supported formats:
+            # - step_delta: [V, 2] step displacement tokens.
+            # - step_corners: [V, 4, 2] single-step box-corner action tokens.
+            # - trajectory_corners: [V, T, 4, 2] full box-corner trajectories.
+            #   This is converted to [V, T, 3] = center x/y + heading.
+            if arr.ndim == 4 and arr.shape[-2:] == (4, 2):
+                if self.codebook_mode != 'trajectory_corners':
+                    raise ValueError(
+                        f"Loaded corner trajectory codebook {arr.shape}, but "
+                        f"ar_codebook_mode={self.codebook_mode!r}. Use "
+                        "agent.config.ar_codebook_mode=trajectory_corners."
+                    )
+                centers = arr.mean(axis=2)
+                heading_vec = arr[:, :, 0, :] - arr[:, :, 3, :]
+                headings = np.arctan2(heading_vec[..., 1], heading_vec[..., 0])[..., None]
+                ego_cb = torch.from_numpy(np.concatenate([centers, headings], axis=-1).astype(np.float32))
+            elif arr.ndim == 3 and arr.shape[-2:] == (4, 2):
+                if self.codebook_mode != 'step_corners':
+                    raise ValueError(
+                        f"Loaded single-step corner codebook {arr.shape}, but "
+                        f"ar_codebook_mode={self.codebook_mode!r}. Use "
+                        "agent.config.ar_codebook_mode=step_corners."
+                    )
+                centers = arr.mean(axis=1)
+                heading_vec = arr[:, 0, :] - arr[:, 3, :]
+                headings = np.arctan2(heading_vec[:, 1], heading_vec[:, 0])[:, None]
+                ego_cb = torch.from_numpy(np.concatenate([centers, headings], axis=-1).astype(np.float32))
+            elif arr.ndim == 3:
+                if self.codebook_mode == 'trajectory_corners':
+                    if arr.shape[-1] < 3:
+                        raise ValueError(f"Trajectory codebook must include heading, got {arr.shape}")
+                    ego_cb = torch.from_numpy(arr[:, :, :3])
+                else:
+                    # [V, T, 3] → [V, T, 2] for legacy step-token path.
+                    ego_cb = torch.from_numpy(arr[:, :, :2])
             else:
                 ego_cb = torch.from_numpy(arr)
             self.ego_vocab_size = ego_cb.shape[0]
             print(f"Loaded ego codebook: {ego_cb.shape} from {self.ego_vocab_path}")
         else:
             print(f"Warning: Ego codebook not found at {self.ego_vocab_path}, using random init")
-            ego_cb = torch.randn(self.ego_vocab_size, self._num_poses, 2) * 0.1
+            if self.codebook_mode == 'trajectory_corners':
+                ego_cb = torch.randn(self.ego_vocab_size, self._num_poses, 3) * 0.1
+            elif self.codebook_mode == 'step_corners':
+                ego_cb = torch.randn(self.ego_vocab_size, 3) * 0.1
+            else:
+                ego_cb = torch.randn(self.ego_vocab_size, 2) * 0.1
 
         self.register_buffer('ego_codebook', ego_cb, persistent=False)
 
@@ -237,12 +276,21 @@ class DiscreteARTrajectoryHead(nn.Module):
     def _causal_mask(self, T: int, device: torch.device) -> torch.Tensor:
         return torch.triu(torch.ones(T, T, device=device, dtype=torch.bool), diagonal=1)
 
+    @staticmethod
+    def _wrap_angle(angle: torch.Tensor) -> torch.Tensor:
+        return torch.atan2(torch.sin(angle), torch.cos(angle))
+
     def _build_trajectory(
         self,
         hidden: torch.Tensor,   # [B, M, T, D]
         tokens: torch.Tensor,   # [B, M, T]
     ) -> torch.Tensor:
         """Decode discrete tokens plus learned residuals into poses."""
+        if self.codebook_mode == 'trajectory_corners':
+            return self._decode_trajectory_tokens(tokens)
+        if self.codebook_mode == 'step_corners':
+            return self._decode_step_corner_tokens(hidden, tokens)
+
         token_deltas = self.ego_codebook[tokens]          # [B, M, T, 2]
         if self.use_residual_delta:
             residual_deltas = self.ego_delta_head(hidden)     # [B, M, T, 2]
@@ -256,6 +304,59 @@ class DiscreteARTrajectoryHead(nn.Module):
         else:
             heading = torch.atan2(deltas_xy[..., 1], deltas_xy[..., 0]).unsqueeze(-1)
         return torch.cat([pos_xy, heading], dim=-1)
+
+    def _decode_step_corner_tokens(
+        self,
+        hidden: torch.Tensor,
+        tokens: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compose local single-step [dx, dy, dtheta] tokens autoregressively."""
+        token_actions = self.ego_codebook[tokens]          # [B, M, T, 3]
+        local_deltas = token_actions[..., :2]
+
+        if self.use_residual_delta:
+            local_deltas = local_deltas + self.ego_delta_head(hidden)
+
+        token_dtheta = token_actions[..., 2:3]
+        if self.use_heading_head:
+            step_dtheta = self.ego_heading_head(hidden)
+        else:
+            step_dtheta = token_dtheta
+
+        positions = []
+        headings = []
+        pos = torch.zeros_like(local_deltas[..., 0, :])
+        heading = torch.zeros_like(step_dtheta[..., 0, :])
+
+        for t in range(local_deltas.shape[2]):
+            cos_h = torch.cos(heading)
+            sin_h = torch.sin(heading)
+            dx = local_deltas[..., t, 0:1]
+            dy = local_deltas[..., t, 1:2]
+            global_delta = torch.cat(
+                [dx * cos_h - dy * sin_h, dx * sin_h + dy * cos_h],
+                dim=-1,
+            )
+            pos = pos + global_delta
+            heading = self._wrap_angle(heading + step_dtheta[..., t, :])
+            positions.append(pos)
+            headings.append(heading)
+
+        pos_xy = torch.stack(positions, dim=2)
+        heading = torch.stack(headings, dim=2)
+        return torch.cat([pos_xy, heading], dim=-1)
+
+    def _decode_trajectory_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
+        """Decode whole-trajectory tokens to [B, M, T, 3] poses."""
+        if tokens.dim() == 3:
+            tokens = tokens[..., 0]
+        traj = self.ego_codebook[tokens]  # [B, M, T, 3]
+        if traj.shape[2] != self._num_poses:
+            raise ValueError(
+                f"Trajectory codebook length {traj.shape[2]} does not match "
+                f"model num_poses {self._num_poses}."
+            )
+        return traj
 
     def select_topk_agents(
         self,
@@ -301,6 +402,69 @@ class DiscreteARTrajectoryHead(nn.Module):
             accumulated = accumulated + codebook[chosen]
 
         return indices
+
+    @torch.no_grad()
+    def match_to_step_corner_codebook(
+        self,
+        gt_traj: torch.Tensor,
+        codebook: torch.Tensor,
+    ) -> torch.Tensor:
+        """Match GT trajectory to local autoregressive single-step action tokens."""
+        B, M, T, _ = gt_traj.shape
+        V = codebook.shape[0]
+
+        indices = torch.zeros(B, M, T, dtype=torch.long, device=gt_traj.device)
+        prev_pos = torch.zeros(B, M, 2, device=gt_traj.device, dtype=gt_traj.dtype)
+        prev_heading = torch.zeros(B, M, 1, device=gt_traj.device, dtype=gt_traj.dtype)
+
+        cb_delta = codebook[:, :2].view(1, 1, V, 2)
+        cb_heading = codebook[:, 2].view(1, 1, V)
+
+        for t in range(T):
+            delta_global = gt_traj[..., t, :2] - prev_pos
+            cos_h = torch.cos(prev_heading)
+            sin_h = torch.sin(prev_heading)
+            local_delta = torch.cat(
+                [
+                    delta_global[..., 0:1] * cos_h + delta_global[..., 1:2] * sin_h,
+                    -delta_global[..., 0:1] * sin_h + delta_global[..., 1:2] * cos_h,
+                ],
+                dim=-1,
+            )
+            local_heading = self._wrap_angle(gt_traj[..., t, 2:3] - prev_heading)
+
+            xy_dist = (cb_delta - local_delta.unsqueeze(2)).pow(2).sum(-1)
+            heading_dist = self._wrap_angle(cb_heading - local_heading.squeeze(-1).unsqueeze(2)).pow(2)
+            chosen = (xy_dist + self.match_heading_weight * heading_dist).argmin(-1)
+
+            indices[..., t] = chosen
+            prev_pos = gt_traj[..., t, :2]
+            prev_heading = gt_traj[..., t, 2:3]
+
+        return indices
+
+    @torch.no_grad()
+    def match_to_trajectory_codebook(
+        self,
+        gt_traj: torch.Tensor,
+        codebook: torch.Tensor,
+    ) -> torch.Tensor:
+        """Match full [x, y, heading] trajectories to whole-trajectory tokens."""
+        if gt_traj.dim() != 4:
+            raise ValueError(f"Expected gt_traj [B, M, T, 3], got {gt_traj.shape}")
+        if codebook.dim() != 3 or codebook.shape[-1] < 3:
+            raise ValueError(f"Expected trajectory codebook [V, T, 3], got {codebook.shape}")
+
+        gt_xy = gt_traj[..., :2].unsqueeze(2)       # [B, M, 1, T, 2]
+        cb_xy = codebook[:, :, :2].view(1, 1, codebook.shape[0], codebook.shape[1], 2)
+        xy_dist = (gt_xy - cb_xy).pow(2).sum(-1).mean(-1)
+
+        gt_h = gt_traj[..., 2].unsqueeze(2)         # [B, M, 1, T]
+        cb_h = codebook[:, :, 2].view(1, 1, codebook.shape[0], codebook.shape[1])
+        heading_dist = self._wrap_angle(gt_h - cb_h).pow(2).mean(-1)
+
+        dist = xy_dist + self.match_heading_weight * heading_dist
+        return dist.argmin(dim=-1)                  # [B, M]
 
     def _attn_stack(
         self,
@@ -363,9 +527,51 @@ class DiscreteARTrajectoryHead(nn.Module):
         if gt_traj.dim() == 3:
             gt_traj = gt_traj.unsqueeze(1).expand(-1, M, -1, -1)  # [B, M, T, 3]
 
-        gt_pos = gt_traj[..., :2]  # [B, M, T, 2]
+        if self.codebook_mode == 'trajectory_corners':
+            return self._forward_train_trajectory_token(
+                ego_base, agent_kv, bev_feat, topk_valid, gt_traj,
+                B, M, T, D, device,
+            )
 
-        ego_gt_tokens = self.match_to_codebook(gt_pos, self.ego_codebook.to(device))
+        if self.codebook_mode == 'step_corners':
+            ego_gt_tokens = self.match_to_step_corner_codebook(gt_traj, self.ego_codebook.to(device))
+        else:
+            gt_pos = gt_traj[..., :2]  # [B, M, T, 2]
+            ego_gt_tokens = self.match_to_codebook(gt_pos, self.ego_codebook.to(device))
+
+        if not self.teacher_forcing:
+            rollout = self._forward_test(
+                ego_base, agent_kv, bev_feat, topk_valid,
+                B, M, T, D, device, temperature=0.0,
+            )
+            logits = rollout['ego_logits'].unsqueeze(1)  # [B, 1, T, V]
+            if M > 1:
+                logits = logits.expand(-1, M, -1, -1)
+
+            token_loss = F.cross_entropy(
+                logits.reshape(-1, self.ego_vocab_size),
+                ego_gt_tokens.reshape(-1),
+                reduction='mean',
+            )
+
+            ego_pred = rollout['trajectory_modes']
+            traj_loss = F.smooth_l1_loss(ego_pred[..., :2], gt_traj[..., :2], reduction='mean')
+            heading_loss = F.smooth_l1_loss(ego_pred[..., 2:], gt_traj[..., 2:], reduction='mean')
+            loss = (
+                self.token_loss_weight * token_loss
+                + self.traj_loss_weight * traj_loss
+                + self.heading_loss_weight * heading_loss
+            )
+
+            return {
+                'trajectory_loss': loss,
+                'trajectory':      ego_pred[:, 0],
+                'ego_tokens':      rollout['ego_tokens'],
+                'ego_logits':      rollout['ego_logits'],
+                'token_loss':      token_loss.detach(),
+                'traj_loss':       traj_loss.detach(),
+                'heading_loss':    heading_loss.detach(),
+            }
 
         mode_e = self.ego_mode_emb.weight.view(1, M, 1, D)
         step_e = self.step_emb.weight.view(1, 1, T, D)
@@ -409,11 +615,63 @@ class DiscreteARTrajectoryHead(nn.Module):
             'heading_loss':    heading_loss.detach(),
         }
 
+    def _forward_train_trajectory_token(
+        self, ego_base, agent_kv, bev_feat, topk_valid, gt_traj,
+        B, M, T, D, device,
+    ):
+        """Train a single discrete token that represents the full trajectory."""
+        ego_gt_tokens = self.match_to_trajectory_codebook(gt_traj, self.ego_codebook.to(device))
+
+        mode_e = self.ego_mode_emb.weight.view(1, M, 1, D)
+        step_e = self.step_emb.weight[0].view(1, 1, 1, D)
+        role_e = self.role_emb.weight[0].view(1, 1, 1, D)
+
+        bos = (self.bos_emb(torch.zeros(1, dtype=torch.long, device=device))
+               .view(1, 1, D) + ego_base.unsqueeze(1))
+        bos = bos.expand(B, M, D)
+
+        ego_q = bos.unsqueeze(2) + step_e + role_e + mode_e
+        ego_q = self._attn_stack(ego_q, agent_kv[:, :, :1, :], bev_feat, topk_valid)
+        logits = self.ego_token_head(ego_q).squeeze(2)  # [B, M, V]
+
+        token_loss = F.cross_entropy(
+            logits.reshape(-1, self.ego_vocab_size),
+            ego_gt_tokens.reshape(-1),
+            reduction='mean',
+        )
+
+        ego_tokens = logits.argmax(-1)
+        ego_pred = self._decode_trajectory_tokens(ego_tokens)
+
+        traj_loss = F.smooth_l1_loss(ego_pred[..., :2], gt_traj[..., :2], reduction='mean')
+        heading_loss = F.smooth_l1_loss(ego_pred[..., 2:], gt_traj[..., 2:], reduction='mean')
+        loss = (
+            self.token_loss_weight * token_loss
+            + self.traj_loss_weight * traj_loss
+            + self.heading_loss_weight * heading_loss
+        )
+
+        return {
+            'trajectory_loss': loss,
+            'trajectory':      ego_pred[:, 0],
+            'ego_tokens':      ego_tokens.unsqueeze(-1),
+            'ego_logits':      logits[:, 0].unsqueeze(1),
+            'token_loss':      token_loss.detach(),
+            'traj_loss':       traj_loss.detach(),
+            'heading_loss':    heading_loss.detach(),
+        }
+
     def _forward_test(
         self, ego_base, agent_kv, bev_feat, topk_valid,
         B, M, T, D, device, temperature: float = 0.0,
     ):
         """Inference with AR decoding."""
+        if self.codebook_mode == 'trajectory_corners':
+            return self._forward_test_trajectory_token(
+                ego_base, agent_kv, bev_feat, topk_valid,
+                B, M, T, D, device, temperature,
+            )
+
         mode_e = self.ego_mode_emb.weight.view(1, M, 1, D)
         step_e = self.step_emb.weight.view(1, 1, T, D)
         role_e = self.role_emb.weight[0].view(1, 1, 1, D)
@@ -455,6 +713,38 @@ class DiscreteARTrajectoryHead(nn.Module):
             'trajectory_modes': ego_pred_full,
             'ego_tokens':       ego_tokens,
             'ego_logits':       ego_logits[:, 0],   # [B, T, V]
+        }
+
+    def _forward_test_trajectory_token(
+        self, ego_base, agent_kv, bev_feat, topk_valid,
+        B, M, T, D, device, temperature: float = 0.0,
+    ):
+        """Inference for whole-trajectory codebook mode."""
+        mode_e = self.ego_mode_emb.weight.view(1, M, 1, D)
+        step_e = self.step_emb.weight[0].view(1, 1, 1, D)
+        role_e = self.role_emb.weight[0].view(1, 1, 1, D)
+
+        bos = (self.bos_emb(torch.zeros(1, dtype=torch.long, device=device))
+               .view(1, 1, D) + ego_base.unsqueeze(1))
+        bos = bos.expand(B, M, D)
+
+        ego_q = bos.unsqueeze(2) + step_e + role_e + mode_e
+        ego_q = self._attn_stack(ego_q, agent_kv[:, :, :1, :], bev_feat, topk_valid)
+        logits = self.ego_token_head(ego_q).squeeze(2)  # [B, M, V]
+
+        if temperature > 0:
+            probs = F.softmax(logits / temperature, dim=-1)
+            tokens = torch.multinomial(probs.view(-1, self.ego_vocab_size), 1).view(B, M)
+        else:
+            tokens = logits.argmax(-1)
+
+        ego_pred_full = self._decode_trajectory_tokens(tokens)
+
+        return {
+            'trajectory':       ego_pred_full[:, 0],
+            'trajectory_modes': ego_pred_full,
+            'ego_tokens':       tokens.unsqueeze(-1),
+            'ego_logits':       logits[:, 0].unsqueeze(1),
         }
 
     # ------------------------------------------------------------------
