@@ -150,6 +150,11 @@ class TransfuserConfig:
     # Checkpoint policy
     ckpt_save_top_k: int = 3                       # how many epoch ckpts to retain
     ckpt_monitor: Optional[str] = "val/loss"       # set None to disable monitoring (keep last N by epoch)
+    # Per-group lr policy: when trunk_lr_mult < 1.0, all params NOT under
+    # `_trajectory_head.` get lr × trunk_lr_mult while AR head keeps full lr.
+    # This protects pretrained backbone/decoder during joint fine-tuning.
+    # Set to 1.0 to disable (default — uses legacy paramwise rule on image_encoder only).
+    trunk_lr_mult: float = 1.0
     freeze_pretrained_trunk: bool = True
     # optimizer=dict(
     #     type="AdamW",

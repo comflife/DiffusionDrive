@@ -31,3 +31,6 @@ codebook_cache/
 diffusiondrive_navsim_88p1_PDMS
 *.log
 
+# Images
+*.png
+

@@ -28,7 +28,14 @@ config:
   ar_codebook_mode: step_delta
   ar_match_heading_weight: 1.0
   ar_teacher_forcing: true
+  ar_step_aware_agent: false
+  ar_use_ego_cross_attn: false
+  ar_use_deformable_bev: false
+  ckpt_save_top_k: 3
+  ckpt_monitor: val/loss
+  trunk_lr_mult: 1.0
   freeze_pretrained_trunk: true
 
 checkpoint_path: /home/byounggun/DiffusionDrive/diffusiondrive_navsim_88p1_PDMS
+checkpoint_save_dir: ${output_dir}/checkpoints
 lr: 2e-4

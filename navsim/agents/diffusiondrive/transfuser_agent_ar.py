@@ -18,8 +18,10 @@ from navsim.agents.diffusiondrive.transfuser_config import TransfuserConfig
 # Import AR model instead of diffusion model
 from navsim.agents.diffusiondrive.transfuser_model_ar import V2TransfuserModelAR as TransfuserModelAR
 
-from navsim.agents.diffusiondrive.transfuser_callback import TransfuserCallback 
+from navsim.agents.diffusiondrive.transfuser_callback import TransfuserCallback
+from navsim.agents.diffusiondrive.transfuser_loss import _agent_loss
 from navsim.agents.diffusiondrive.transfuser_features import TransfuserFeatureBuilder, TransfuserTargetBuilder
+import torch.nn.functional as F
 from navsim.common.dataclasses import SensorConfig
 from navsim.planning.training.abstract_feature_target_builder import AbstractFeatureBuilder, AbstractTargetBuilder
 from navsim.agents.diffusiondrive.modules.scheduler import WarmupCosLR
@@ -223,34 +225,48 @@ class TransfuserAgentAR(AbstractAgent):
     ) -> Dict[str, torch.Tensor]:
         """
         Compute loss for AR model.
-        
-        Uses trajectory_loss computed by AR head (CrossEntropy).
-        Returns dict with 'loss' key and other loss components for logging.
+
+        - trajectory_loss: AR head's internal weighted CE + traj L1 + heading L1.
+        - When the trunk is being trained (freeze_pretrained_trunk=False), the
+          agent_head and bev_semantic_head also need direct supervision; otherwise
+          they drift and the AR head's agent_kv input degrades.
         """
-        # AR head returns trajectory_loss directly when targets provided
         if 'trajectory_loss' in predictions:
             traj_loss = predictions['trajectory_loss']
         else:
-            # Re-run forward with targets to get loss
-            # This is needed because LightningModule calls forward without targets
+            # Lightning calls forward(features, targets) so this is a defensive fallback only.
             predictions_with_loss = self._transfuser_model(features, targets=targets)
-            if 'trajectory_loss' in predictions_with_loss:
-                traj_loss = predictions_with_loss['trajectory_loss']
-            else:
-                # Fallback: compute L1 loss on trajectory
-                pred_traj = predictions['trajectory']
-                gt_traj = targets['trajectory']
-                traj_loss = torch.nn.functional.l1_loss(pred_traj, gt_traj)
-        
-        # Return dict with loss components for logging
-        loss_dict = {
-            'loss': traj_loss,
-            'trajectory_loss': traj_loss,
-        }
+            traj_loss = predictions_with_loss.get(
+                'trajectory_loss',
+                F.l1_loss(predictions['trajectory'], targets['trajectory']),
+            )
 
+        loss_dict = {'trajectory_loss': traj_loss}
         for key in ['token_loss', 'traj_loss', 'heading_loss']:
             if key in predictions:
                 loss_dict[key] = predictions[key]
+
+        # Auxiliary supervision on agent_head + bev_semantic_head. Skip when the
+        # trunk is fully frozen (only the AR head trains; aux losses contribute
+        # nothing because their parameters have requires_grad=False).
+        cfg = self._config
+        trunk_frozen = bool(getattr(cfg, "freeze_pretrained_trunk", False))
+        if not trunk_frozen and 'agent_states' in predictions and 'bev_semantic_map' in predictions:
+            agent_class_loss, agent_box_loss = _agent_loss(targets, predictions, cfg)
+            bev_semantic_loss = F.cross_entropy(
+                predictions['bev_semantic_map'], targets['bev_semantic_map'].long()
+            )
+            aux = (
+                cfg.agent_class_weight * agent_class_loss
+                + cfg.agent_box_weight * agent_box_loss
+                + cfg.bev_semantic_weight * bev_semantic_loss
+            )
+            loss_dict['agent_class_loss'] = agent_class_loss.detach()
+            loss_dict['agent_box_loss'] = agent_box_loss.detach()
+            loss_dict['bev_semantic_loss'] = bev_semantic_loss.detach()
+            loss_dict['loss'] = traj_loss + aux
+        else:
+            loss_dict['loss'] = traj_loss
 
         return loss_dict
 
@@ -272,9 +288,45 @@ class TransfuserAgentAR(AbstractAgent):
         return {'optimizer': optimizer, 'lr_scheduler': scheduler}
 
     def get_coslr_optimizers(self):
+        # Head/trunk split: when trunk_lr_mult < 1.0, route all params NOT under
+        # `_trajectory_head.` to a low-lr group. This is the recommended setup
+        # for joint fine-tuning with a pretrained trunk + a fresh AR head.
+        trunk_lr_mult = float(getattr(self._config, "trunk_lr_mult", 1.0))
+        if trunk_lr_mult < 1.0:
+            head_params, trunk_params = [], []
+            for name, p in self._transfuser_model.named_parameters():
+                if not p.requires_grad:
+                    continue
+                if name.startswith("_trajectory_head"):
+                    head_params.append(p)
+                else:
+                    trunk_params.append(p)
+            head_lr  = self._lr
+            trunk_lr = self._lr * trunk_lr_mult
+            print(
+                f"[lr] head ({len(head_params)} tensors) lr={head_lr:.2e}  |  "
+                f"trunk ({len(trunk_params)} tensors) lr={trunk_lr:.2e}"
+            )
+            # WarmupCosLR scales each group by `lr_scale` if present in group[0].
+            optimizer = torch.optim.AdamW(
+                [
+                    {"params": head_params,  "lr": head_lr,  "lr_scale": 1.0},
+                    {"params": trunk_params, "lr": trunk_lr, "lr_scale": trunk_lr_mult},
+                ],
+                weight_decay=self._config.weight_decay,
+            )
+            scheduler = WarmupCosLR(
+                optimizer=optimizer,
+                lr=self._lr,
+                min_lr=1e-6,
+                epochs=100,
+                warmup_epochs=3,
+            )
+            return {"optimizer": optimizer, "lr_scheduler": scheduler}
+
         optimizer_cfg = dict(
-            type=self._config.optimizer_type, 
-            lr=self._lr, 
+            type=self._config.optimizer_type,
+            lr=self._lr,
             weight_decay=self._config.weight_decay,
             paramwise_cfg=self._config.opt_paramwise_cfg
         )
