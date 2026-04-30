@@ -5,96 +5,22 @@ This repository implements a discrete autoregressive planner on top of the Diffu
 The original diffusion decoder is kept as a baseline, but the current main workflow replaces the trajectory head with a **discrete token-based autoregressive decoder**:
 
 1. Load the pretrained DiffusionDrive NAVSIM checkpoint.
-2. Freeze the pretrained trunk.
-3. Train a discrete autoregressive decoder with supervised fine-tuning.
-4. Optionally continue with GRPO using PDMS as the reward.
+2. Either freeze the pretrained trunk and train only the AR head (SFT-frozen), or jointly fine-tune the trunk with a smaller learning rate (SFT-joint).
+3. Optionally continue with GRPO using PDMS as the reward.
 
 ## What We Changed
 
-We maintain the original DiffusionDrive backbone, but the planning head has been replaced with discrete autoregressive decoders.
-
-At a high level, the planner now behaves more like a sequence model over motion primitives than a direct continuous trajectory regressor.
-
-The important distinction is:
+We keep the original DiffusionDrive backbone but replace the diffusion-based trajectory head with a discrete autoregressive decoder. At a high level the planner now behaves more like a sequence model over motion primitives than a continuous trajectory regressor:
 
 - the policy predicts **discrete token IDs**
 - the token sequence is generated **autoregressively**
-- the final reported trajectory is a **continuous refinement** of that token sequence
+- the final reported `(x, y, heading)` trajectory is a **continuous refinement** of that token sequence
 
-So yes, this is a discrete autoregressive decoder. The planning decision itself lives in token space, but the final `(x, y, heading)` trajectory is reconstructed from those tokens with additional continuous refinement heads.
-
-## Baseline AR vs AR+
-
-| Item | Baseline AR | AR+ |
-| --- | --- | --- |
-| Agent name | `diffusiondrive_ar_agent` | `diffusiondrive_ar_plus_agent` |
-| Core planner type | Single-policy discrete AR | Single-policy discrete AR |
-| Token space | Ego codebook tokens | Ego codebook tokens |
-| Final output | Token-based plan + continuous refinement | Token-based plan + continuous refinement |
-| BOS | Ego-centered BOS | Rich BOS from ego + BEV + agent summary + status |
-| Agent conditioning | Basic top-k agent context | Stronger agent-state-aware context |
-| Time dependency in agent context | Simpler repeated agent context | Step-aware agent context |
-| Agent usage during decoding | Cross-attention | Cross-attention + ego-conditioned gating |
-| Main goal | Stable discrete AR baseline | Stronger conditioning without diffusion |
-| Main files | `transfuser_model_ar.py`, `transfuser_agent_ar.py` | `transfuser_model_ar_plus.py`, `transfuser_agent_ar_plus.py` |
-
-## Current Results
-
-The following scores are from the current NAVSIM evaluation runs for the two discrete AR variants.
-
-| Metric | Baseline AR | AR+ |
-| --- | ---: | ---: |
-| NC | 98.1352 | 98.1846 |
-| DAC | 95.3153 | 95.4965 |
-| TTC | 94.5414 | 94.6402 |
-| Comf. | 99.9424 | 99.9424 |
-| EP | 81.4239 | 81.5735 |
-| PDMS | 87.1281 | 87.3599 |
-
-At the moment, AR+ is slightly better than the baseline AR on every reported metric except comfort, where they are tied.
-
-### Baseline AR
-
-The baseline AR model is a single-policy discrete autoregressive decoder.
-
-- `agent=diffusiondrive_ar_agent`
-- model file: [navsim/agents/diffusiondrive/transfuser_model_ar.py](navsim/agents/diffusiondrive/transfuser_model_ar.py)
-- agent file: [navsim/agents/diffusiondrive/transfuser_agent_ar.py](navsim/agents/diffusiondrive/transfuser_agent_ar.py)
-- config file: [navsim/planning/script/config/common/agent/diffusiondrive_ar_agent.yaml](navsim/planning/script/config/common/agent/diffusiondrive_ar_agent.yaml)
-
-Key properties:
-
-- single-mode AR policy: `ar_num_modes=1`
-- ego action space is a discrete codebook loaded from `codebook_cache/navsim_kdisk_v512/ego.npy`
-- token prediction is autoregressive
-- training uses teacher forcing only for SFT next-token prediction
-- trajectory reconstruction is not token-only:
-  token coarse motion is refined by residual continuous heads
-- training loss is:
-  token cross-entropy + trajectory SmoothL1 + heading SmoothL1
-- pretrained trunk is frozen and only the AR trajectory head is updated
-
-### AR+
-
-AR+ is a stronger discrete AR decoder variant intended to improve conditioning without bringing diffusion back into the planner.
-
-- `agent=diffusiondrive_ar_plus_agent`
-- model file: [navsim/agents/diffusiondrive/transfuser_model_ar_plus.py](navsim/agents/diffusiondrive/transfuser_model_ar_plus.py)
-- agent file: [navsim/agents/diffusiondrive/transfuser_agent_ar_plus.py](navsim/agents/diffusiondrive/transfuser_agent_ar_plus.py)
-- config file: [navsim/planning/script/config/common/agent/diffusiondrive_ar_plus_agent.yaml](navsim/planning/script/config/common/agent/diffusiondrive_ar_plus_agent.yaml)
-
-Compared with baseline AR, AR+ adds:
-
-- richer BOS construction from ego query, BEV summary, agent summary, and status encoding
-- stronger agent-state-aware conditioning
-- step-aware agent context instead of simple static repetition
-- ego-conditioned gating over agent context
-
-This is still a discrete autoregressive planner, not a diffusion planner.
+The planning decision lives in token space, but the final output is reconstructed from those tokens with continuous residual heads.
 
 ## Architecture
 
-The backbone (Transfuser) is frozen; only the Trajectory Head is replaced by a **Discrete Autoregressive Decoder**.
+The Transfuser backbone (image/lidar encoder + transformer decoder + agent head + BEV semantic head) is reused. Only the trajectory head is swapped for a `DiscreteARTrajectoryHead` defined in [navsim/agents/diffusiondrive/transfuser_model_ar.py](navsim/agents/diffusiondrive/transfuser_model_ar.py).
 
 ```
 Camera / Lidar
@@ -119,11 +45,10 @@ Camera / Lidar
            ▼                 ▼
 ┌─────────────────────────────────────────────────────────────┐
 │           Discrete Autoregressive Decoder                   │
-│         (RichDiscreteARTrajectoryHead)                      │
+│         (DiscreteARTrajectoryHead)                          │
 │                                                             │
 │   ┌─────────────────────────────────────────────────────┐   │
-│   │  Input: BOS token + Rich Ego Context                │   │
-│   │         (ego + BEV summary + agent summary + status)│   │
+│   │  Input: BOS + ego context (trajectory query)        │   │
 │   └────────────────────────┬────────────────────────────┘   │
 │                            │                                │
 │                            ▼                                │
@@ -131,20 +56,25 @@ Camera / Lidar
 │   │  For t = 0 ... T-1  (autoregressive)                │   │
 │   │                                                     │   │
 │   │   ┌─────────────┐                                   │   │
-│   │   │ Temporal    │  ← causal self-attention         │   │
-│   │   │ Self-Attn   │     (only attends 0..t)          │   │
+│   │   │ Temporal    │  ← causal self-attention          │   │
+│   │   │ Self-Attn   │     (only attends 0..t)           │   │
 │   │   └──────┬──────┘                                   │   │
 │   │          │                                          │   │
 │   │          ▼                                          │   │
-│   │   ┌─────────────┐      agent features at t          │   │
-│   │   │ Ego-Agent   │  ←  [query + bbox state + score]  │   │
-│   │   │ Cross-Attn  │     with ego-conditioned gating   │   │
+│   │   ┌─────────────┐ (optional) per-layer ego          │   │
+│   │   │ Ego CrossA  │  cross-attn to ego_base           │   │
 │   │   └──────┬──────┘                                   │   │
 │   │          │                                          │   │
 │   │          ▼                                          │   │
-│   │   ┌─────────────┐      BEV grid features            │   │
-│   │   │ BEV         │  ←  cross-attention               │   │
-│   │   │ Cross-Attn  │                                   │   │
+│   │   ┌─────────────┐  agent features at step t         │   │
+│   │   │ Ego-Agent   │  ← top-K continuous agents        │   │
+│   │   │ Cross-Attn  │    (optional step-aware fusion)   │   │
+│   │   └──────┬──────┘                                   │   │
+│   │          │                                          │   │
+│   │          ▼                                          │   │
+│   │   ┌─────────────┐  BEV features                     │   │
+│   │   │ BEV Cross-  │  flat global, OR                  │   │
+│   │   │ Attn        │  waypoint-aware deformable        │   │
 │   │   └──────┬──────┘                                   │   │
 │   │          │                                          │   │
 │   │          ▼                                          │   │
@@ -153,214 +83,179 @@ Camera / Lidar
 │   │   └──────┬──────┘                                   │   │
 │   │          │                                          │   │
 │   │          ▼                                          │   │
-│   │   [Token Logit_t] ──► argmax ──► token_t           │   │
+│   │   [Token Logit_t] ──► argmax/sampling ──► token_t   │   │
 │   │          │                                          │   │
-│   │          └─────────────────────────────────────┐    │   │
-│   │                                                │    │   │
-│   │   token_t ──► embedding ──► input_{t+1}       │    │   │
-│   └────────────────────────────────────────────────┘    │   │
-│                            │                              │
-│                            ▼                              │
-│   ┌─────────────────────────────────────────────────────┐ │
-│   │  Output Construction                                │ │
-│   │                                                     │ │
-│   │   tokens ──► ego_codebook[tokens]   = token_deltas  │ │
-│   │            + ego_delta_head(hidden) = residuals     │ │
-│   │            ──────────────────────────────────────   │ │
-│   │            = final_deltas  ──► cumsum ──► (x, y)    │ │
-│   │                                                     │ │
-│   │   hidden ──► ego_heading_head()     = heading       │ │
-│   │                                                     │ │
-│   │            ──────────────────────────────────────   │ │
-│   │            = Final Trajectory (x, y, θ)             │ │
-│   └─────────────────────────────────────────────────────┘ │
+│   │   token_t ──► embedding ──► input_{t+1}             │   │
+│   └─────────────────────────────────────────────────────┘   │
+│                            │                                │
+│                            ▼                                │
+│   ┌─────────────────────────────────────────────────────┐   │
+│   │  Trajectory Reconstruction                          │   │
+│   │   (depends on codebook mode — see below)            │   │
+│   │                                                     │   │
+│   │   = Final Trajectory (x, y, θ)                      │   │
+│   └─────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### Core Idea: Codebook Lookup + Residual Head
-
-This is the easiest way to think about the current planner:
-
-1. The decoder predicts a motion token at each future step.
-2. Each token maps to a coarse motion primitive in the ego codebook.
-3. The decoder hidden state predicts a small residual correction on top of that primitive.
-4. A separate head predicts heading.
-5. The corrected per-step motions are accumulated into the final trajectory.
-
-So the final output is not "raw coordinates directly from a regression head", and it is also not "token lookup only".
-
-It is:
-
-- discrete motion planning first
-- continuous geometric refinement second
-
-That design keeps the planner token-based, while avoiding the large quantization error of a pure token-only rollout.
-
-The decoder's `ego_token_head` classifies a codebook index at each timestep:
+The `ego_token_head` classifies a codebook index at each timestep:
 
 ```python
 logits = self.ego_token_head(ego_q)   # [B, M, T, V]
 tokens = logits.argmax(-1)            # [B, M, T]
 ```
 
-However, the token is **not used directly as coordinates**. Instead, a two-stage post-processing refines the trajectory:
+The token is **not used directly as coordinates**. Instead, a coarse-to-fine post-process refines the trajectory: discrete token decides the coarse motion primitive, residual head fixes the quantization gap, heading head produces orientation.
 
-```python
-# 1. Codebook Lookup: base displacement for the token
-token_deltas = self.ego_codebook[tokens]          # [B, M, T, 2]
+### Codebook Modes
 
-# 2. Residual Head: fine adjustment predicted from hidden state
-residual_deltas = self.ego_delta_head(hidden)     # [B, M, T, 2]
+`DiscreteARTrajectoryHead` supports three codebook modes, switched by `agent.config.ar_codebook_mode`:
 
-# 3. Sum and cumsum → absolute coordinates
-deltas_xy = token_deltas + residual_deltas
-pos_xy = deltas_xy.cumsum(dim=2)                  # [B, M, T, 2]
+| Mode | Codebook shape | Token meaning | Reconstruction |
+| --- | --- | --- | --- |
+| `step_delta` | `[V, 2]` | per-step `(dx, dy)` displacement in ego frame | `cumsum(token_deltas + residual_deltas)` |
+| `step_corners` | `[V, 3]` | per-step local `(dx, dy, dθ)` action | rolled forward through running pose; residual delta on `(dx, dy)` |
+| `trajectory_corners` | `[V, T, 3]` | full `(x, y, θ)` trajectory in one token | direct lookup; single-step decode |
 
-# 4. Heading is predicted by a separate continuous head
-heading = self.ego_heading_head(hidden)           # [B, M, T, 1]
-```
+In `step_delta` and `step_corners` the residual head adds a small continuous correction on top of the codebook lookup. In `trajectory_corners` the codebook entry is the entire trajectory and there is no residual on top.
 
-This creates a **coarse-to-fine** collaboration: the discrete token decides the coarse direction, and the residual head handles fine-grained correction.
+### Optional Decoder Components
 
-Another way to read this is:
+The AR head exposes several flags to control conditioning strength:
 
-- token sequence = the planner's motion language
-- codebook lookup = convert that language into coarse step motions
-- residual head = fix the parts the finite codebook cannot represent precisely
-- heading head = make the final trajectory orientation-aware
+- `ar_use_residual_delta` (default `true`): add residual `(dx, dy)` correction from hidden state.
+- `ar_use_heading_head` (default `true`): predict heading from hidden state. When `false` (only meaningful in `step_corners`), the codebook's discrete `dθ` is used directly — heading then has no gradient signal except via token CE.
+- `ar_step_aware_agent` (default `false`): nonlinear `(agent, step_emb)` fusion so the agent K/V varies per step.
+- `ar_use_ego_cross_attn` (default `false`): per-layer cross-attention to a length-1 ego context, mirroring the original diffusion conditioning.
+- `ar_use_deformable_bev` (default `false`): waypoint-aware grid-sample BEV cross-attention instead of global flat attention. Reference points are derived causally from already-decoded tokens.
+- `ar_teacher_forcing` (default `true`): teacher forcing for SFT. When `false`, the model is supervised on its own AR rollout.
 
-This is why the model is still a discrete AR planner even though the final trajectory is continuous.
+## Loss
+
+`TransfuserAgentAR.compute_loss` ([navsim/agents/diffusiondrive/transfuser_agent_ar.py](navsim/agents/diffusiondrive/transfuser_agent_ar.py)) builds the total loss in two parts:
+
+1. **Trajectory loss** (always on): the AR head's internal weighted sum
+   ```
+   trajectory_loss = ar_token_loss_weight   * token_CE
+                   + ar_traj_loss_weight    * traj_smoothL1
+                   + ar_heading_loss_weight * heading_smoothL1
+   ```
+2. **Auxiliary loss** (only when `freeze_pretrained_trunk=false`): the original Transfuser supervision on the trunk-side heads
+   ```
+   aux = agent_class_weight * agent_class_CE
+       + agent_box_weight   * agent_box_L1
+       + bev_semantic_weight * bev_semantic_CE
+   total = trajectory_loss + aux
+   ```
+   This is required during joint trunk fine-tuning. Without it, `agent_head` (whose output is consumed by the AR head as `agent_kv`) and `bev_semantic_head` would drift, since trajectory_loss alone gives them no direct gradient.
+
+When the trunk is fully frozen, only the AR head trains and the auxiliary terms are skipped (their parameters have `requires_grad=False`, so they would contribute nothing).
 
 ## Base Checkpoint
 
-All AR experiments are initialized from the pretrained DiffusionDrive NAVSIM checkpoint:
+All AR experiments start from the pretrained DiffusionDrive NAVSIM checkpoint:
 
 - `diffusiondrive_navsim_88p1_PDMS`
 
-This checkpoint is used to initialize the trunk. The AR head is newly initialized, and the pretrained trunk is frozen during AR training.
+The trunk weights (backbone, transformer decoder, agent head, BEV semantic head) are loaded from this file. The new AR trajectory head is initialized fresh — its keys are reported as "missing" by `init_from_pretrained`, while the old diffusion head's keys are reported as "unexpected" and silently dropped.
 
 ## Codebook
 
-The ego codebook currently used by the AR models is:
+Codebooks live under [codebook_cache/](codebook_cache/). The active ones:
 
-- `codebook_cache/navsim_kdisk_v512/ego.npy`
+| Path | Mode | Shape | Notes |
+| --- | --- | --- | --- |
+| `codebook_cache/navsim_kdisk_v512/ego.npy` | `step_delta` | `(512, 2)` | Single-step displacements |
+| `codebook_cache/navsim_kdisk_v2048_diffusiondrive/ego.npy` | `step_corners` | `(2048, 4, 2)` | Loaded as `(V, 3)` after corner→`(x, y, θ)` reduction |
+| `codebook_cache/navsim_kdisk_v512_diffusiondrive/ego.npy` | `trajectory_corners` | `(512, 6, 4, 2)` | Loaded as `(V, T, 3)` after corner→`(x, y, θ)` reduction |
 
-Current assumption:
-
-- shape is effectively `[512, 2]`
-- each token represents a single-step local displacement primitive
-
-The AR decoder predicts token sequences over this codebook and then reconstructs continuous trajectories with residual refinement.
-
-Example intuition:
-
-- one token may correspond to "small forward step"
-- another may correspond to "forward plus slight left offset"
-- another may correspond to "shorter curved step"
-
-The exact vectors are learned by the codebook creation process, but conceptually they behave like a vocabulary of local motion primitives.
-
-You can generate a new codebook with:
+You can generate a new codebook with the scripts under [create_codebook/](create_codebook/), e.g.:
 
 ```bash
-python navsim_create_codebook_diffusiondrive.py \
+python create_codebook/navsim_create_codebook_diffusiondrive.py \
     --data_path /path/to/navsim/logs/trainval \
-    --output codebook_cache/navsim_kdisk_v512/ego.npy \
-    --vocab_size 512 \
-    --n_trajs 100000 \
-    --tol_dist 0.05 \
-    --seed 42
+    --output codebook_cache/navsim_kdisk_v2048_diffusiondrive/ego.npy \
+    --vocab_size 2048
 ```
+
+The exact CLI varies between scripts — read the `argparse` block at the top of each one.
 
 ## Training
 
-### 1. Baseline AR SFT
-
-Script: [run_training_ar.sh](run_training_ar.sh)
-
-Run:
+All training scripts live under [train_eval/](train_eval/). Run them from the repo root:
 
 ```bash
 cd DiffusionDrive
-bash run_training_ar.sh
+bash train_eval/<script>.sh
 ```
 
-Current default settings:
+Edit the script first to point `NAVSIM_EXP_ROOT`, `OPENSCENE_DATA_ROOT`, `cache_path`, and `output_dir` at your storage.
 
-- pretrained checkpoint: `diffusiondrive_navsim_88p1_PDMS`
-- trunk freeze: `true`
-- batch size: `64` per GPU
-- devices: `4`
-- learning rate: `2e-4`
-- loss weights:
-  - token: `1.0`
-  - trajectory: `8.0`
-  - heading: `2.0`
+### Frozen-trunk SFT (V=512, step_delta)
 
-### 2. AR+ SFT
+[train_eval/run_training_ar_v512_full_v2_frozen.sh](train_eval/run_training_ar_v512_full_v2_frozen.sh) — minimal config: trunk is frozen, only the AR head trains.
 
-Script: [run_training_ar_plus.sh](run_training_ar_plus.sh)
+Key overrides:
 
-Run:
+- `agent.config.freeze_pretrained_trunk=true`
+- `agent.config.ego_vocab_size=512`
+- `agent.config.ar_codebook_mode=step_delta`
 
-```bash
-cd DiffusionDrive
-bash run_training_ar_plus.sh
-```
+### Joint-trunk SFT (V=2048, step_corners) — recommended
 
-This uses the same pretrained trunk and similar hyperparameters, but swaps the decoder to AR+.
+[train_eval/run_training_ar_step_corner_v2048_joint_v2.sh](train_eval/run_training_ar_step_corner_v2048_joint_v2.sh) — current main recipe.
+
+Key overrides:
+
+- `agent.config.freeze_pretrained_trunk=false`
+- `agent.config.trunk_lr_mult=0.05` → trunk gets `lr × 0.05` while the AR head keeps full lr
+- `agent.config.ego_vocab_size=2048`
+- `agent.config.ar_codebook_mode=step_corners`
+- `agent.config.ar_use_residual_delta=true`, `ar_use_heading_head=false` (heading comes from the discrete token's `dθ`)
+- `agent.config.ar_step_aware_agent=true`
+- `agent.config.ar_use_ego_cross_attn=true`
+- `agent.config.ar_use_deformable_bev=true`
+
+In joint mode the auxiliary `agent_class_loss`, `agent_box_loss`, and `bev_semantic_loss` are added automatically — see the **Loss** section.
+
+### Other available recipes
+
+[train_eval/](train_eval/) contains a handful of related ablations:
+
+- `run_training_ar_v512_full_v2.sh` — V=512 step_delta, joint trunk
+- `run_training_ar_step_corner_v2048_full.sh` — V=2048 step_corners with default heading head
+- `run_training_ar_step_corner_v2048_heading_stepagent.sh` — heading head + step-aware agent
+- `run_training_ar_step_corner_v2048_heading_stepagent_notf.sh` — same but with `teacher_forcing=false`
+- `run_training_ar_step_corner_v2048_scratch.sh` — train from scratch (no pretrained trunk)
 
 ## Evaluation
 
-### Baseline AR Evaluation
+Eval scripts mirror the training recipes and live in the same folder:
 
-Script: [run_eval_ar_base_latest.sh](run_eval_ar_base_latest.sh)
+- [train_eval/run_eval_ar_v512_full_v2_frozen_latest.sh](train_eval/run_eval_ar_v512_full_v2_frozen_latest.sh)
+- [train_eval/run_eval_ar_v512_full_v2_latest.sh](train_eval/run_eval_ar_v512_full_v2_latest.sh)
+- [train_eval/run_eval_ar_step_corner_v2048_full_latest.sh](train_eval/run_eval_ar_step_corner_v2048_full_latest.sh)
+- [train_eval/run_eval_ar_step_corner_v2048_heading_stepagent_latest.sh](train_eval/run_eval_ar_step_corner_v2048_heading_stepagent_latest.sh)
+- [train_eval/run_eval_ar_step_corner_v2048_heading_stepagent_notf_latest.sh](train_eval/run_eval_ar_step_corner_v2048_heading_stepagent_notf_latest.sh)
 
-Run:
-
-```bash
-cd DiffusionDrive
-bash run_eval_ar_base_latest.sh
-```
-
-Current evaluated checkpoint (edit the script to match your path):
-
-- `/path/to/diffusiondrive-ar/checkpoints/last.ckpt`
-
-### AR+ Evaluation
-
-Script: [run_eval_ar_plus_latest.sh](run_eval_ar_plus_latest.sh)
-
-Run:
+Edit the `agent.checkpoint_path` line in the script to point at your `last.ckpt`, then:
 
 ```bash
-cd DiffusionDrive
-bash run_eval_ar_plus_latest.sh
+bash train_eval/run_eval_ar_step_corner_v2048_full_latest.sh
 ```
-
-Current evaluated checkpoint (edit the script to match your path):
-
-- `/path/to/diffusiondrive-ar-plus/checkpoints/last.ckpt`
 
 ## GRPO Fine-Tuning
 
-After SFT, the baseline AR model can be further tuned with GRPO using PDMS as the reward.
+After SFT, the AR model can be further tuned with GRPO using PDMS as the reward.
 
-### GRPO Setup
+### Training
 
-Script: [run_grpo_training_base_t08.sh](run_grpo_training_base_t08.sh)
+- [train_eval/run_grpo_training.sh](train_eval/run_grpo_training.sh)
+- [train_eval/run_grpo_training_base_t08.sh](train_eval/run_grpo_training_base_t08.sh)
 
-Run:
+Default GRPO setup (in `run_grpo_training_base_t08.sh`):
 
-```bash
-cd DiffusionDrive
-bash run_grpo_training_base_t08.sh
-```
-
-Current GRPO setup (edit the script to match your checkpoint path):
-
-- base checkpoint: `/path/to/diffusiondrive-ar/checkpoints/last.ckpt`
-- train split for GRPO rollouts: `navtest`
+- train split for rollouts: `navtest`
 - reward: PDMS
 - group size: `16`
 - sampling temperature: `0.8`
@@ -370,44 +265,34 @@ Current GRPO setup (edit the script to match your checkpoint path):
 
 Implementation notes:
 
-- rollout generation is autoregressive sampling, not GT teacher forcing
-- token log-probs are recomputed teacher-forced on sampled trajectories for PPO/GRPO loss
+- rollouts are AR sampling, not teacher forcing
+- the loss recomputes log-probs in **teacher-forced** mode on the rollout tokens (`V2TransfuserModelAR.compute_token_log_probs`) so that `log π_θ(a_t | s, a_{<t})` conditions on the rollout — not the model's own AR predictions
 - reward is sequence-level PDMS
-- reference KL is computed from the token distributions
+- KL is computed against a frozen reference model
 
-### GRPO Evaluation
+### Evaluation
 
-Script: [run_eval_grpo_base_t08.sh](run_eval_grpo_base_t08.sh)
+- [train_eval/run_eval_grpo_base_t08.sh](train_eval/run_eval_grpo_base_t08.sh)
+- [train_eval/run_eval_grpo_latest.sh](train_eval/run_eval_grpo_latest.sh)
+- [train_eval/run_eval_grpo_epoch0.sh](train_eval/run_eval_grpo_epoch0.sh)
+- [train_eval/run_eval_grpo_converted.sh](train_eval/run_eval_grpo_converted.sh)
 
-Run:
-
-```bash
-cd DiffusionDrive
-bash run_eval_grpo_base_t08.sh
-```
-
-Current evaluated checkpoint (edit the script to match your path):
-
-- `/path/to/diffusiondrive_grpo_output/checkpoints/last.ckpt`
-
-Output directory:
-
-- `/path/to/diffusiondrive_grpo_output/eval_latest`
+Edit the script's `agent.checkpoint_path` to your GRPO `last.ckpt`, then run.
 
 ## Main Files
 
 Core files for the current AR workflow:
 
-- [navsim/agents/diffusiondrive/transfuser_config.py](navsim/agents/diffusiondrive/transfuser_config.py)
-- [navsim/agents/diffusiondrive/transfuser_model_ar.py](navsim/agents/diffusiondrive/transfuser_model_ar.py)
-- [navsim/agents/diffusiondrive/transfuser_agent_ar.py](navsim/agents/diffusiondrive/transfuser_agent_ar.py)
-- [navsim/agents/diffusiondrive/transfuser_model_ar_plus.py](navsim/agents/diffusiondrive/transfuser_model_ar_plus.py)
-- [navsim/agents/diffusiondrive/transfuser_agent_ar_plus.py](navsim/agents/diffusiondrive/transfuser_agent_ar_plus.py)
+- [navsim/agents/diffusiondrive/transfuser_config.py](navsim/agents/diffusiondrive/transfuser_config.py) — config dataclass (AR options live here)
+- [navsim/agents/diffusiondrive/transfuser_model_ar.py](navsim/agents/diffusiondrive/transfuser_model_ar.py) — `V2TransfuserModelAR` + `DiscreteARTrajectoryHead`
+- [navsim/agents/diffusiondrive/transfuser_agent_ar.py](navsim/agents/diffusiondrive/transfuser_agent_ar.py) — Lightning agent wrapper, optimizer / loss / checkpoint policy
+- [navsim/agents/diffusiondrive/transfuser_loss.py](navsim/agents/diffusiondrive/transfuser_loss.py) — agent / BEV auxiliary losses (reused for joint training)
 - [navsim/agents/diffusiondrive/grpo_trainer.py](navsim/agents/diffusiondrive/grpo_trainer.py)
 - [navsim/agents/diffusiondrive/grpo_train.py](navsim/agents/diffusiondrive/grpo_train.py)
+- [navsim/planning/script/config/common/agent/diffusiondrive_ar_agent.yaml](navsim/planning/script/config/common/agent/diffusiondrive_ar_agent.yaml) — default agent config
 
 ## Notes
 
-- The repository still contains the original DiffusionDrive codebase, but this README documents the current discrete AR training flow we are actively using.
-- Baseline AR and AR+ are intentionally separated into different agents and scripts for clean experiment tracking.
-- GRPO is currently wired to the baseline AR model path. If AR+ becomes the preferred SFT model, the GRPO trainer should be connected to AR+ explicitly.
+- The repository still contains the original DiffusionDrive codebase (`transfuser_model_v2.py`, `transfuser_agent.py`) for reference.
+- When `freeze_pretrained_trunk=false` you must keep the auxiliary losses on (they are added automatically by `compute_loss`); otherwise the agent and BEV heads drift and degrade the AR head's `agent_kv` input.
+- `trunk_lr_mult < 1.0` triggers a head/trunk LR split inside `get_coslr_optimizers`: the AR head keeps `agent.lr`, while everything else (backbone, transformer decoder, agent head, BEV semantic head) gets `agent.lr × trunk_lr_mult`. Use this for joint fine-tuning to protect the pretrained trunk.
