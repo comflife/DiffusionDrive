@@ -24,7 +24,7 @@ import torch.nn.functional as F
 from navsim.agents.diffusiondrive.transfuser_config import TransfuserConfig
 from navsim.agents.diffusiondrive.transfuser_backbone import TransfuserBackbone
 from navsim.agents.diffusiondrive.transfuser_features import BoundingBox2DIndex
-from navsim.agents.diffusiondrive.modules.blocks import linear_relu_ln
+from navsim.agents.diffusiondrive.modules.blocks import linear_relu_ln, GridSampleCrossBEVAttention
 
 
 class AgentHead(nn.Module):
@@ -95,6 +95,9 @@ class DiscreteARTrajectoryHead(nn.Module):
         self.codebook_mode = getattr(config, 'ar_codebook_mode', 'step_delta')
         self.match_heading_weight = getattr(config, 'ar_match_heading_weight', 1.0)
         self.teacher_forcing = getattr(config, 'ar_teacher_forcing', True)
+        self.use_step_aware_agent = getattr(config, 'ar_step_aware_agent', False)
+        self.use_ego_cross_attn   = getattr(config, 'ar_use_ego_cross_attn', False)
+        self.use_deformable_bev   = getattr(config, 'ar_use_deformable_bev', False)
 
         # Ego vocabulary
         self.ego_vocab_size = getattr(config, 'ego_vocab_size', 512)
@@ -124,6 +127,15 @@ class DiscreteARTrajectoryHead(nn.Module):
             nn.ReLU(inplace=True),
         )
 
+        # Optional: nonlinear (agent, step) fusion so agent K/V varies per step
+        # instead of being identical across T with only an additive step_emb.
+        if self.use_step_aware_agent:
+            self.step_agent_proj = nn.Sequential(
+                nn.Linear(d_model * 2, d_model),
+                nn.LayerNorm(d_model),
+                nn.ReLU(inplace=True),
+            )
+
         # Ego token embeddings
         self.ego_token_emb = nn.Embedding(self.ego_vocab_size, d_model)
 
@@ -147,12 +159,35 @@ class DiscreteARTrajectoryHead(nn.Module):
         ])
         self.e2a_norm = nn.ModuleList([nn.LayerNorm(d_model) for _ in range(self.num_layers)])
 
-        # 3. BEV cross-attention
+        # 3. BEV cross-attention (global flatten — used when use_deformable_bev=False)
         self.bev_attn = nn.ModuleList([
             nn.MultiheadAttention(d_model, self.num_heads, dropout=self.dropout, batch_first=True)
             for _ in range(self.num_layers)
         ])
         self.bev_norm = nn.ModuleList([nn.LayerNorm(d_model) for _ in range(self.num_layers)])
+
+        # 3b. Deformable BEV cross-attention (waypoint-aware, used when use_deformable_bev=True)
+        if self.use_deformable_bev:
+            self.bev_deform_attn = nn.ModuleList([
+                GridSampleCrossBEVAttention(
+                    embed_dims=d_model,
+                    num_heads=self.num_heads,
+                    num_levels=1,
+                    in_bev_dims=d_model,    # cross_bev_feature is already d_model dim
+                    num_points=1,           # one ref point per AR query position
+                    config=config,
+                )
+                for _ in range(self.num_layers)
+            ])
+            self.bev_deform_norm = nn.ModuleList([nn.LayerNorm(d_model) for _ in range(self.num_layers)])
+
+        # 4. Per-layer ego cross-attention (recovers original diffusion conditioning)
+        if self.use_ego_cross_attn:
+            self.ego_attn = nn.ModuleList([
+                nn.MultiheadAttention(d_model, self.num_heads, dropout=self.dropout, batch_first=True)
+                for _ in range(self.num_layers)
+            ])
+            self.ego_norm = nn.ModuleList([nn.LayerNorm(d_model) for _ in range(self.num_layers)])
 
         # FFN
         self.ffn = nn.ModuleList([
@@ -260,6 +295,13 @@ class DiscreteARTrajectoryHead(nn.Module):
                 if isinstance(module, nn.Linear):
                     nn.init.xavier_uniform_(module.weight)
                     nn.init.zeros_(module.bias)
+        if self.use_step_aware_agent:
+            for module in self.step_agent_proj:
+                if isinstance(module, nn.Linear):
+                    nn.init.xavier_uniform_(module.weight)
+                    nn.init.zeros_(module.bias)
+        # Per-layer ego cross-attn and deformable BEV use their internal default
+        # initializations (MultiheadAttention's xavier, GridSampleCrossBEVAttention.init_weight()).
 
     def _configure_optional_heads(self):
         if not self.use_residual_delta:
@@ -275,6 +317,88 @@ class DiscreteARTrajectoryHead(nn.Module):
 
     def _causal_mask(self, T: int, device: torch.device) -> torch.Tensor:
         return torch.triu(torch.ones(T, T, device=device, dtype=torch.bool), diagonal=1)
+
+    @torch.no_grad()
+    def _compute_ref_pts_from_tokens(
+        self,
+        tokens: torch.Tensor,   # [B, M, T] full token sequence
+        T: int,
+    ) -> torch.Tensor:
+        """Reference points (BEV xy) per AR query position, derived from already-decoded tokens.
+
+        ref[t] = cumulative ego position at the START of step t
+               = sum of decoded actions for tokens 0..t-1
+        ref[0] = (0, 0)
+
+        Causal-safe: position t's ref depends only on tokens 0..t-1.
+        """
+        B, M = tokens.shape[:2]
+        device = tokens.device
+        dtype = self.ego_codebook.dtype
+
+        if self.codebook_mode == 'trajectory_corners':
+            return torch.zeros(B, M, T, 2, device=device, dtype=dtype)
+
+        ref = torch.zeros(B, M, T, 2, device=device, dtype=dtype)
+
+        if self.codebook_mode == 'step_corners':
+            action = self.ego_codebook[tokens]   # [B, M, T, 3]
+            local_dx = action[..., 0]
+            local_dy = action[..., 1]
+            local_dtheta = action[..., 2]
+            pos = torch.zeros(B, M, 2, device=device, dtype=dtype)
+            heading = torch.zeros(B, M, device=device, dtype=dtype)
+            for t in range(T - 1):
+                cos_h = torch.cos(heading)
+                sin_h = torch.sin(heading)
+                global_dx = local_dx[..., t] * cos_h - local_dy[..., t] * sin_h
+                global_dy = local_dx[..., t] * sin_h + local_dy[..., t] * cos_h
+                pos = pos + torch.stack([global_dx, global_dy], dim=-1)
+                heading = self._wrap_angle(heading + local_dtheta[..., t])
+                ref[..., t + 1, :] = pos
+            return ref
+
+        # step_delta: simple cumsum
+        delta = self.ego_codebook[tokens][..., :2]   # [B, M, T, 2]
+        ref[..., 1:, :] = delta[..., :-1, :].cumsum(dim=-2)
+        return ref
+
+    @torch.no_grad()
+    def _step_running_pos(
+        self,
+        pos: torch.Tensor,        # [B, M, 2]
+        heading: torch.Tensor,    # [B, M]
+        token: torch.Tensor,      # [B, M]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Single AR-rollout update of running ego pose given the latest predicted token."""
+        if self.codebook_mode == 'step_corners':
+            action = self.ego_codebook[token]   # [B, M, 3]
+            cos_h = torch.cos(heading)
+            sin_h = torch.sin(heading)
+            global_dx = action[..., 0] * cos_h - action[..., 1] * sin_h
+            global_dy = action[..., 0] * sin_h + action[..., 1] * cos_h
+            new_pos = pos + torch.stack([global_dx, global_dy], dim=-1)
+            new_heading = self._wrap_angle(heading + action[..., 2])
+            return new_pos, new_heading
+        # step_delta or trajectory_corners (latter unused here)
+        delta = self.ego_codebook[token][..., :2]   # [B, M, 2]
+        return pos + delta, heading
+
+    def _build_agent_kv(self, agent_encoded: torch.Tensor, T: int) -> torch.Tensor:
+        """Compose agent K/V for the AR cross-attention.
+
+        Default (additive): agent_encoded broadcast across T + step_emb + role.
+        Step-aware: nonlinear fusion of (agent, step_emb) so agent rep varies per step.
+        """
+        B, K, D = agent_encoded.shape
+        role_a = self.role_emb.weight[1].view(1, 1, 1, D)
+        if self.use_step_aware_agent:
+            step_e = self.step_emb.weight.view(1, 1, T, D).expand(B, K, T, D)
+            agent_t = agent_encoded.unsqueeze(2).expand(B, K, T, D)
+            agent_kv = self.step_agent_proj(torch.cat([agent_t, step_e], dim=-1))
+            return agent_kv + role_a
+        step_e = self.step_emb.weight.view(1, 1, T, D)
+        return agent_encoded.unsqueeze(2).expand(-1, -1, T, -1) + step_e + role_a
 
     @staticmethod
     def _wrap_angle(angle: torch.Tensor) -> torch.Tensor:
@@ -468,10 +592,14 @@ class DiscreteARTrajectoryHead(nn.Module):
 
     def _attn_stack(
         self,
-        ego_q:     torch.Tensor,   # [B, M, T, D]
-        agent_kv:  torch.Tensor,   # [B, K, T, D]
-        bev_feat:  torch.Tensor,   # [B, P, D]
-        topk_valid: torch.Tensor,  # [B, K]
+        ego_q:     torch.Tensor,            # [B, M, T, D]
+        agent_kv:  torch.Tensor,            # [B, K, T, D]
+        bev_feat:  torch.Tensor,            # [B, P, D]   (flat, used when not deformable)
+        topk_valid: torch.Tensor,           # [B, K]
+        ego_base:  Optional[torch.Tensor] = None,           # [B, D] — for per-layer ego cross-attn
+        bev_2d:    Optional[torch.Tensor] = None,           # [B, D, H, W] — for deformable
+        bev_spatial_shape: Optional[Tuple[int, int]] = None,
+        ref_pts:   Optional[torch.Tensor] = None,           # [B, M, T, 2]
     ) -> torch.Tensor:
         """AR attention stack."""
         B, M, T, D = ego_q.shape
@@ -485,13 +613,27 @@ class DiscreteARTrajectoryHead(nn.Module):
 
         P = bev_feat.shape[1]
 
+        # Pre-expand ego K/V for per-layer ego cross-attn
+        if self.use_ego_cross_attn and ego_base is not None:
+            ego_kv_bm = (ego_base.unsqueeze(1)             # [B, 1, D]
+                         .unsqueeze(1).expand(-1, M, -1, -1)
+                         .reshape(B * M, 1, D))
+
         for i in range(self.num_layers):
-            # Temporal self-attention
+            # 1. Temporal self-attention (causal)
             eg  = ego_q.reshape(B * M, T, D)
             eg2, _ = self.t_attn[i](eg, eg, eg, attn_mask=caus)
             ego_q  = self.t_norm[i](eg + eg2).reshape(B, M, T, D)
 
-            # Ego-agent cross-attention (continuous agent features per timestep)
+            # 2. (Optional) Per-layer ego cross-attention — recovers original
+            # diffusion's per-layer ego_query conditioning. Causal-safe: K/V is
+            # external scene context (length-1), not part of the AR sequence.
+            if self.use_ego_cross_attn and ego_base is not None:
+                eg_MT = ego_q.reshape(B * M, T, D)
+                eg2, _ = self.ego_attn[i](eg_MT, ego_kv_bm, ego_kv_bm)
+                ego_q  = self.ego_norm[i](eg_MT + eg2).reshape(B, M, T, D)
+
+            # 3. Ego-agent cross-attention (continuous agent features per timestep)
             new_ego = []
             for t in range(T):
                 q  = ego_q[:, :, t, :].reshape(B * M, 1, D)
@@ -502,13 +644,29 @@ class DiscreteARTrajectoryHead(nn.Module):
                 new_ego.append(self.e2a_norm[i](q + out).reshape(B, M, D))
             ego_q = torch.stack(new_ego, dim=2)
 
-            # BEV cross-attention
-            eg_MT = ego_q.reshape(B * M, T, D)
-            bev_bm = bev_feat.unsqueeze(1).expand(-1, M, -1, -1).reshape(B * M, P, D)
-            eg2, _ = self.bev_attn[i](eg_MT, bev_bm, bev_bm)
-            ego_q  = self.bev_norm[i](eg_MT + eg2).reshape(B, M, T, D)
+            # 4. BEV cross-attention — deformable (waypoint-aware) or global flat.
+            if (
+                self.use_deformable_bev
+                and bev_2d is not None
+                and ref_pts is not None
+                and bev_spatial_shape is not None
+            ):
+                eg_MT = ego_q.reshape(B * M, T, D)
+                # Expand bev_2d to B*M batch (replicate per mode)
+                bev_2d_bm = (bev_2d.unsqueeze(1).expand(-1, M, -1, -1, -1)
+                             .reshape(B * M, *bev_2d.shape[1:]))
+                # ref_pts [B, M, T, 2] → [B*M, T, num_points=1, 2]
+                ref_pts_bm = ref_pts.reshape(B * M, T, 1, 2)
+                # GridSampleCrossBEVAttention internally does residual + dropout
+                out = self.bev_deform_attn[i](eg_MT, ref_pts_bm, bev_2d_bm, bev_spatial_shape)
+                ego_q = self.bev_deform_norm[i](out).reshape(B, M, T, D)
+            else:
+                eg_MT = ego_q.reshape(B * M, T, D)
+                bev_bm = bev_feat.unsqueeze(1).expand(-1, M, -1, -1).reshape(B * M, P, D)
+                eg2, _ = self.bev_attn[i](eg_MT, bev_bm, bev_bm)
+                ego_q  = self.bev_norm[i](eg_MT + eg2).reshape(B, M, T, D)
 
-            # FFN
+            # 5. FFN
             ego_q = self.ffn_norm[i](ego_q + self.ffn[i](ego_q))
 
         return ego_q
@@ -520,6 +678,7 @@ class DiscreteARTrajectoryHead(nn.Module):
     def _forward_train(
         self, ego_base, agent_kv, bev_feat, topk_valid, targets,
         B, M, T, D, device,
+        bev_2d=None, bev_spatial_shape=None,
     ):
         """Training with teacher forcing."""
         gt_traj = targets['trajectory']   # [B, T, 3]
@@ -531,6 +690,7 @@ class DiscreteARTrajectoryHead(nn.Module):
             return self._forward_train_trajectory_token(
                 ego_base, agent_kv, bev_feat, topk_valid, gt_traj,
                 B, M, T, D, device,
+                bev_2d=bev_2d, bev_spatial_shape=bev_spatial_shape,
             )
 
         if self.codebook_mode == 'step_corners':
@@ -543,6 +703,7 @@ class DiscreteARTrajectoryHead(nn.Module):
             rollout = self._forward_test(
                 ego_base, agent_kv, bev_feat, topk_valid,
                 B, M, T, D, device, temperature=0.0,
+                bev_2d=bev_2d, bev_spatial_shape=bev_spatial_shape,
             )
             logits = rollout['ego_logits'].unsqueeze(1)  # [B, 1, T, V]
             if M > 1:
@@ -584,8 +745,16 @@ class DiscreteARTrajectoryHead(nn.Module):
         tok_embs   = self.ego_token_emb(ego_gt_tokens[:, :, :-1])  # [B, M, T-1, D]
         input_embs = torch.cat([bos.unsqueeze(2), tok_embs], dim=2)  # [B, M, T, D]
 
+        # Reference points for deformable BEV (causal: derived from GT input tokens)
+        ref_pts = self._compute_ref_pts_from_tokens(ego_gt_tokens, T) \
+            if self.use_deformable_bev else None
+
         ego_q  = input_embs + step_e + role_e + mode_e
-        ego_q  = self._attn_stack(ego_q, agent_kv, bev_feat, topk_valid)
+        ego_q  = self._attn_stack(
+            ego_q, agent_kv, bev_feat, topk_valid,
+            ego_base=ego_base if self.use_ego_cross_attn else None,
+            bev_2d=bev_2d, bev_spatial_shape=bev_spatial_shape, ref_pts=ref_pts,
+        )
         logits = self.ego_token_head(ego_q)  # [B, M, T, V]
 
         token_loss = F.cross_entropy(
@@ -618,6 +787,7 @@ class DiscreteARTrajectoryHead(nn.Module):
     def _forward_train_trajectory_token(
         self, ego_base, agent_kv, bev_feat, topk_valid, gt_traj,
         B, M, T, D, device,
+        bev_2d=None, bev_spatial_shape=None,
     ):
         """Train a single discrete token that represents the full trajectory."""
         ego_gt_tokens = self.match_to_trajectory_codebook(gt_traj, self.ego_codebook.to(device))
@@ -631,7 +801,12 @@ class DiscreteARTrajectoryHead(nn.Module):
         bos = bos.expand(B, M, D)
 
         ego_q = bos.unsqueeze(2) + step_e + role_e + mode_e
-        ego_q = self._attn_stack(ego_q, agent_kv[:, :, :1, :], bev_feat, topk_valid)
+        # trajectory_corners is single-token, so no meaningful ref points;
+        # deformable BEV is silently disabled in this mode.
+        ego_q = self._attn_stack(
+            ego_q, agent_kv[:, :, :1, :], bev_feat, topk_valid,
+            ego_base=ego_base if self.use_ego_cross_attn else None,
+        )
         logits = self.ego_token_head(ego_q).squeeze(2)  # [B, M, V]
 
         token_loss = F.cross_entropy(
@@ -664,12 +839,14 @@ class DiscreteARTrajectoryHead(nn.Module):
     def _forward_test(
         self, ego_base, agent_kv, bev_feat, topk_valid,
         B, M, T, D, device, temperature: float = 0.0,
+        bev_2d=None, bev_spatial_shape=None,
     ):
         """Inference with AR decoding."""
         if self.codebook_mode == 'trajectory_corners':
             return self._forward_test_trajectory_token(
                 ego_base, agent_kv, bev_feat, topk_valid,
                 B, M, T, D, device, temperature,
+                bev_2d=bev_2d, bev_spatial_shape=bev_spatial_shape,
             )
 
         mode_e = self.ego_mode_emb.weight.view(1, M, 1, D)
@@ -683,12 +860,26 @@ class DiscreteARTrajectoryHead(nn.Module):
         input_embs = torch.zeros(B, M, T, D, device=device)
         input_embs[:, :, 0, :] = bos
 
+        # Causal running pose for deformable BEV ref points.
+        running_pos = torch.zeros(B, M, 2, device=device, dtype=self.ego_codebook.dtype) \
+            if self.use_deformable_bev else None
+        running_heading = torch.zeros(B, M, device=device, dtype=self.ego_codebook.dtype) \
+            if self.use_deformable_bev else None
+        ref_pts = torch.zeros(B, M, T, 2, device=device, dtype=self.ego_codebook.dtype) \
+            if self.use_deformable_bev else None
+
+        ego_kw = dict(
+            ego_base=ego_base if self.use_ego_cross_attn else None,
+            bev_2d=bev_2d, bev_spatial_shape=bev_spatial_shape,
+        )
+
         predicted_tokens: list = []
         all_logits:       list = []
 
         for t in range(T):
             ego_q   = input_embs + step_e + role_e + mode_e
-            ego_out = self._attn_stack(ego_q, agent_kv, bev_feat, topk_valid)
+            ego_out = self._attn_stack(ego_q, agent_kv, bev_feat, topk_valid,
+                                       ref_pts=ref_pts, **ego_kw)
             logit_t = self.ego_token_head(ego_out[:, :, t, :])   # [B, M, V]
             all_logits.append(logit_t)
 
@@ -702,10 +893,21 @@ class DiscreteARTrajectoryHead(nn.Module):
 
             if t < T - 1:
                 input_embs[:, :, t + 1, :] = self.ego_token_emb(tok_t)
+                # Update running pose and ref_pts[t+1] from the just-predicted token
+                if self.use_deformable_bev:
+                    running_pos, running_heading = self._step_running_pos(
+                        running_pos, running_heading, tok_t)
+                    ref_pts[:, :, t + 1, :] = running_pos
 
         ego_tokens = torch.stack(predicted_tokens, dim=2)    # [B, M, T]
         ego_logits = torch.stack(all_logits,        dim=2)   # [B, M, T, V]
-        ego_hidden = self._attn_stack(input_embs + step_e + role_e + mode_e, agent_kv, bev_feat, topk_valid)
+        # Final pass with full sequence for trajectory decoding (refines hidden states).
+        if self.use_deformable_bev:
+            # Build ref_pts from the FULL predicted sequence (now we know all tokens).
+            ref_pts = self._compute_ref_pts_from_tokens(ego_tokens, T)
+        ego_hidden = self._attn_stack(input_embs + step_e + role_e + mode_e,
+                                      agent_kv, bev_feat, topk_valid,
+                                      ref_pts=ref_pts, **ego_kw)
         ego_pred_full = self._build_trajectory(ego_hidden, ego_tokens)
 
         return {
@@ -718,6 +920,7 @@ class DiscreteARTrajectoryHead(nn.Module):
     def _forward_test_trajectory_token(
         self, ego_base, agent_kv, bev_feat, topk_valid,
         B, M, T, D, device, temperature: float = 0.0,
+        bev_2d=None, bev_spatial_shape=None,
     ):
         """Inference for whole-trajectory codebook mode."""
         mode_e = self.ego_mode_emb.weight.view(1, M, 1, D)
@@ -729,7 +932,10 @@ class DiscreteARTrajectoryHead(nn.Module):
         bos = bos.expand(B, M, D)
 
         ego_q = bos.unsqueeze(2) + step_e + role_e + mode_e
-        ego_q = self._attn_stack(ego_q, agent_kv[:, :, :1, :], bev_feat, topk_valid)
+        ego_q = self._attn_stack(
+            ego_q, agent_kv[:, :, :1, :], bev_feat, topk_valid,
+            ego_base=ego_base if self.use_ego_cross_attn else None,
+        )
         logits = self.ego_token_head(ego_q).squeeze(2)  # [B, M, V]
 
         if temperature > 0:
@@ -760,6 +966,8 @@ class DiscreteARTrajectoryHead(nn.Module):
         given_tokens: torch.Tensor,  # [B, T]  token indices to evaluate
         B: int, T: int, D: int,
         device: torch.device,
+        bev_2d:      Optional[torch.Tensor] = None,
+        bev_spatial_shape: Optional[Tuple[int, int]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Teacher-forced log probability computation for GRPO.
@@ -792,7 +1000,18 @@ class DiscreteARTrajectoryHead(nn.Module):
         input_embs = torch.cat([bos.unsqueeze(2), tok_embs], dim=2)  # [B, 1, T, D]
 
         ego_q  = input_embs + step_e + role_e + mode_e           # [B, 1, T, D]
-        ego_q  = self._attn_stack(ego_q, agent_kv, bev_feat, topk_valid)
+        # Reference points (mode-0 only, [B, 1, T, 2])
+        if self.use_deformable_bev:
+            ref_pts = self._compute_ref_pts_from_tokens(
+                given_tokens.unsqueeze(1), T,                    # [B, 1, T]
+            )
+        else:
+            ref_pts = None
+        ego_q  = self._attn_stack(
+            ego_q, agent_kv, bev_feat, topk_valid,
+            ego_base=ego_base if self.use_ego_cross_attn else None,
+            bev_2d=bev_2d, bev_spatial_shape=bev_spatial_shape, ref_pts=ref_pts,
+        )
         logits = self.ego_token_head(ego_q[:, 0])                # [B, T, V]
 
         # Gather log probs for the given tokens
@@ -825,6 +1044,9 @@ class DiscreteARTrajectoryHead(nn.Module):
 
         bev_flat = bev_feature.flatten(2).permute(0, 2, 1)   # [B, H*W, D]
         bev_feat = self.bev_proj(bev_flat)
+        # Keep raw 2D for deformable BEV sampling (waypoint-aware)
+        bev_2d = bev_feature                                  # [B, D, H, W]
+        bev_spatial_shape = bev_feature.shape[2:]             # (H, W)
 
         topk_idx, topk_valid = self.select_topk_agents(agent_states, agent_labels)
         K = topk_idx.shape[1]
@@ -833,9 +1055,7 @@ class DiscreteARTrajectoryHead(nn.Module):
         agent_ctx  = agents_query.gather(1, tidx)                     # [B, K, D]
         agent_encoded = self.agent_encoder(agent_ctx)                  # [B, K, D]
 
-        step_e  = self.step_emb.weight.view(1, 1, T, D)
-        role_a  = self.role_emb.weight[1].view(1, 1, 1, D)
-        agent_kv = agent_encoded.unsqueeze(2).expand(-1, -1, T, -1) + step_e + role_a
+        agent_kv = self._build_agent_kv(agent_encoded, T)
 
         ego_ctx  = ego_query[:, 0, :]
         ego_base = self.ego_ctx_proj(ego_ctx)
@@ -844,11 +1064,13 @@ class DiscreteARTrajectoryHead(nn.Module):
             return self._forward_train(
                 ego_base, agent_kv, bev_feat, topk_valid, targets,
                 B, M, T, D, device,
+                bev_2d=bev_2d, bev_spatial_shape=bev_spatial_shape,
             )
         else:
             return self._forward_test(
                 ego_base, agent_kv, bev_feat, topk_valid,
                 B, M, T, D, device, temperature,
+                bev_2d=bev_2d, bev_spatial_shape=bev_spatial_shape,
             )
 
 
@@ -1053,12 +1275,12 @@ class V2TransfuserModelAR(nn.Module):
         agent_ctx  = bb['agents_query'].gather(1, tidx)                  # [B, K, D]
         agent_enc  = self._trajectory_head.agent_encoder(agent_ctx)      # [B, K, D]
 
-        step_e   = self._trajectory_head.step_emb.weight.view(1, 1, T, D)
-        role_a   = self._trajectory_head.role_emb.weight[1].view(1, 1, 1, D)
-        agent_kv = agent_enc.unsqueeze(2).expand(-1, -1, T, -1) + step_e + role_a
+        agent_kv = self._trajectory_head._build_agent_kv(agent_enc, T)
 
         # BEV features
-        bev_flat = bb['cross_bev_feature'].flatten(2).permute(0, 2, 1)  # [B, P, D]
+        bev_2d = bb['cross_bev_feature']                                # [B, D, H, W]
+        bev_spatial_shape = bev_2d.shape[2:]
+        bev_flat = bev_2d.flatten(2).permute(0, 2, 1)                   # [B, P, D]
         bev_feat = self._trajectory_head.bev_proj(bev_flat)
 
         # Ego context
@@ -1068,4 +1290,5 @@ class V2TransfuserModelAR(nn.Module):
         return self._trajectory_head._compute_token_log_probs_tf(
             ego_base, agent_kv, bev_feat, topk_valid,
             given_tokens, B, T, D, device,
+            bev_2d=bev_2d, bev_spatial_shape=bev_spatial_shape,
         )

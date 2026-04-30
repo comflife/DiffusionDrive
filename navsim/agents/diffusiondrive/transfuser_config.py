@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Tuple, List
+from typing import Tuple, List, Optional
 
 import numpy as np
 from nuplan.common.maps.abstract_map import SemanticMapLayer
@@ -144,6 +144,12 @@ class TransfuserConfig:
     ar_codebook_mode: str = "step_delta"  # step_delta, step_corners, or trajectory_corners
     ar_match_heading_weight: float = 1.0
     ar_teacher_forcing: bool = True
+    ar_step_aware_agent: bool = False  # nonlinear (agent, step) fusion instead of additive step_emb
+    ar_use_ego_cross_attn: bool = False  # per-layer cross-attn to ego_base (recovers original diffusion conditioning)
+    ar_use_deformable_bev: bool = False  # waypoint-aware deformable BEV sampling instead of global flat attn
+    # Checkpoint policy
+    ckpt_save_top_k: int = 3                       # how many epoch ckpts to retain
+    ckpt_monitor: Optional[str] = "val/loss"       # set None to disable monitoring (keep last N by epoch)
     freeze_pretrained_trunk: bool = True
     # optimizer=dict(
     #     type="AdamW",

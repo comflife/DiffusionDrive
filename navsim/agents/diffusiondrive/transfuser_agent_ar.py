@@ -25,6 +25,36 @@ from navsim.planning.training.abstract_feature_target_builder import AbstractFea
 from navsim.agents.diffusiondrive.modules.scheduler import WarmupCosLR
 from omegaconf import DictConfig, OmegaConf, open_dict
 import torch.optim as optim
+import os
+import glob
+
+
+class RollingLastNCheckpoint(pl.Callback):
+    """Save a checkpoint each epoch and keep only the most recent N.
+
+    Used when val is skipped — there's no metric to monitor, so we just
+    retain a sliding window of the latest train epochs.
+    """
+
+    def __init__(self, dirpath: str, n: int = 5, filename_template: str = "epoch_{epoch:02d}.ckpt"):
+        super().__init__()
+        self.dirpath = dirpath
+        self.n = n
+        self.filename_template = filename_template
+
+    def on_train_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
+        if trainer.is_global_zero:
+            os.makedirs(self.dirpath, exist_ok=True)
+            epoch = trainer.current_epoch
+            path = os.path.join(self.dirpath, self.filename_template.format(epoch=epoch))
+            trainer.save_checkpoint(path)
+            existing = sorted(glob.glob(os.path.join(self.dirpath, "epoch_*.ckpt")))
+            while len(existing) > self.n:
+                old = existing.pop(0)
+                try:
+                    os.remove(old)
+                except OSError:
+                    pass
 
 
 def build_from_configs(obj, cfg: DictConfig, **kwargs):
@@ -45,20 +75,25 @@ class TransfuserAgentAR(AbstractAgent):
         config: TransfuserConfig,
         lr: float,
         checkpoint_path: Optional[str] = None,
+        checkpoint_save_dir: Optional[str] = None,
         **kwargs
     ):
         """
         Initializes TransFuser AR agent.
-        
+
         :param config: global config of TransFuser agent
         :param lr: learning rate during training
         :param checkpoint_path: optional path string to checkpoint
+        :param checkpoint_save_dir: optional explicit dir for ModelCheckpoint to write into.
+            If None, falls back to Lightning's default (which routes through WandbLogger
+            and produces wandb_run_id-named subfolders).
         """
         super().__init__()
 
         self._config = config
         self._lr = lr
         self._checkpoint_path = checkpoint_path
+        self._checkpoint_save_dir = checkpoint_save_dir
         
         # Use AR model
         self._transfuser_model = TransfuserModelAR(config)
@@ -295,15 +330,23 @@ class TransfuserAgentAR(AbstractAgent):
     def get_training_callbacks(self) -> List[pl.Callback]:
         """Inherited, see superclass."""
         from pytorch_lightning.callbacks import ModelCheckpoint
-        
-        checkpoint_callback = ModelCheckpoint(
-            dirpath=None,  # Uses default_root_dir from Trainer
-            filename='{epoch:02d}-{val_loss:.2f}',
-            save_top_k=3,
-            monitor='val/loss',
-            mode='min',
-            save_last=True,
-            every_n_epochs=1,
-        )
-        
+
+        save_top_k = getattr(self._config, "ckpt_save_top_k", 3)
+        monitor    = getattr(self._config, "ckpt_monitor", "val/loss")
+
+        if monitor in (None, "", "null", "None"):
+            # No metric monitoring: rolling window of latest N epoch ckpts.
+            ckpt_dir = self._checkpoint_save_dir or "lightning_logs/checkpoints"
+            checkpoint_callback = RollingLastNCheckpoint(dirpath=ckpt_dir, n=save_top_k)
+        else:
+            checkpoint_callback = ModelCheckpoint(
+                dirpath=self._checkpoint_save_dir,
+                filename='{epoch:02d}-{val_loss:.2f}',
+                save_top_k=save_top_k,
+                monitor=monitor,
+                mode='min',
+                save_last=True,
+                every_n_epochs=1,
+            )
+
         return [TransfuserCallback(self._config), checkpoint_callback]
