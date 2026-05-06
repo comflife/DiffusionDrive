@@ -19,6 +19,21 @@ Fixes applied (v2):
 4. [Bug4] PPO importance ratio w/ clipping using stored old log_probs
 5. [Bug5] Advantage std clamped (min=1e-3) + advantage clipped to [-5, 5]
 6. [Bug6] Batched forward pass: single backbone call for all G rollouts
+
+Fixes applied (v3):
+7. [Bug7] log_softmax now uses the SAMPLING temperature for old/new/ref alike,
+          so the importance ratio correctly tracks π(·|T) → π'(·|T). Previously
+          old/new were at unit T while samples came from π(·|T<1), biasing PPO.
+8. [Bug8] PDM reward no longer overrides the model's predicted heading with
+          atan2(pos_diffs). For step_corners / heading_head=true models the
+          override discarded the actual heading channel; now we trust the
+          model's heading. (Legacy step_delta + heading_head=false models
+          already produced atan2-equivalent heading inside _build_trajectory,
+          so the override was redundant in that case too.)
+9. [Bug9] PDM-scoring failures are tracked instead of silently returning 0:
+          `pdm_failure_streak` counts consecutive failures and raises after
+          PDM_FAIL_RAISE_AFTER (default 50) — long silent streaks used to
+          collapse advantages to ~0 and stall training.
 """
 
 import torch
@@ -31,6 +46,7 @@ from dataclasses import dataclass
 import pytorch_lightning as pl
 
 from navsim.agents.diffusiondrive.transfuser_model_ar import V2TransfuserModelAR
+from navsim.agents.diffusiondrive.transfuser_agent_ar import TransfuserAgentAR
 from navsim.agents.diffusiondrive.transfuser_config import TransfuserConfig
 from navsim.evaluate.pdm_score import pdm_score
 from navsim.planning.simulation.planner.pdm_planner.simulation.pdm_simulator import PDMSimulator
@@ -68,18 +84,34 @@ class GRPOTrainer(pl.LightningModule):
         group_size: int = 8,    # number of rollouts per scene
         kl_coef: float = 0.01,  # KL penalty coefficient
         temperature: float = 1.0,  # sampling temperature
-        clip_eps: float = 0.2,  # PPO clipping epsilon  ← NEW
+        clip_eps: float = 0.2,  # PPO clipping epsilon (GRPO token-level)
+        algorithm: str = 'grpo',     # 'grpo' | 'gspo' | 'gspo_token' | 'grpo_plus'
+        clip_eps_seq: float = 4e-4,  # sequence-level clipping eps for GSPO / GRPO+
+        token_attention_alpha: float = 0.5,  # GRPO+: blend (1-α)·GSPO + α·token-attn
         max_grad_norm: float = 1.0,
         **kwargs,
     ):
         super().__init__()
         self.save_hyperparameters()
 
+        if algorithm not in ('grpo', 'gspo', 'gspo_token', 'grpo_plus'):
+            raise ValueError(
+                "algorithm must be one of 'grpo', 'gspo', 'gspo_token', 'grpo_plus'; "
+                f"got {algorithm!r}"
+            )
+        if not (0.0 <= float(token_attention_alpha) <= 1.0):
+            raise ValueError(
+                f"token_attention_alpha must be in [0, 1]; got {token_attention_alpha}"
+            )
+
         self.config = config
         self.group_size = group_size
         self.kl_coef = kl_coef
         self.temperature = temperature
-        self.clip_eps = clip_eps          # ← NEW
+        self.clip_eps = clip_eps
+        self.algorithm = algorithm
+        self.clip_eps_seq = clip_eps_seq
+        self.token_attention_alpha = float(token_attention_alpha)
         self.max_grad_norm = max_grad_norm
 
         # Policy model (trainable)
@@ -89,22 +121,61 @@ class GRPOTrainer(pl.LightningModule):
         if checkpoint_path:
             self._load_pretrained(checkpoint_path)
 
-        # Reference model (frozen, for KL penalty)
+        # Reference model (frozen, for KL penalty).
+        # We construct it then copy policy's state_dict in. Building each model
+        # separately would give the AR-specific freshly-random modules
+        # (ego_token_emb, ego_ctx_proj, agent_encoder, step_agent_proj, t_attn,
+        # ...) DIFFERENT random draws between policy and reference — at step 0
+        # the categorical KL would already be > 0, contaminating the KL signal
+        # and pulling the policy back toward a different random init instead
+        # of the warm-started one. Mirroring policy guarantees KL == 0 at init.
         self.reference_model = V2TransfuserModelAR(config)
-        if checkpoint_path:
-            self._load_pretrained(checkpoint_path, model=self.reference_model)
+        self.reference_model.load_state_dict(self.policy_model.state_dict())
         self._freeze_model(self.reference_model)
 
         # PDM components for reward computation
         self.simulator: Optional[PDMSimulator] = None
         self.scorer:    Optional[PDMScorer]    = None
 
+        # PDM failure tracking (Bug9): consecutive failures cause silent
+        # advantage collapse, so raise once a long streak builds up.
+        self.pdm_failure_streak: int = 0
+        self.pdm_failure_total:  int = 0
+        self.PDM_FAIL_RAISE_AFTER: int = 50
+
+    @staticmethod
+    def _safe_temperature(t: float) -> float:
+        """Clamp sampling temperature to a strictly positive value.
+
+        T == 0 means greedy sampling — there is no well-defined importance
+        ratio in that case, so we fall back to T = 1 for log-prob computations
+        (the gradient is then taken w.r.t. the unit-T policy, which is still
+        well-defined; the user just shouldn't expect PPO-style correction).
+        """
+        return max(float(t), 1e-6) if float(t) > 0 else 1.0
+
+    @staticmethod
+    def _gather_token_log_probs(
+        log_probs_all: torch.Tensor,   # [..., T, V]
+        tokens:        torch.Tensor,   # [..., T]
+    ) -> torch.Tensor:
+        """Index log_probs_all by tokens to get [..., T] log probs."""
+        return torch.gather(log_probs_all, dim=-1, index=tokens.unsqueeze(-1)).squeeze(-1)
+
     # ------------------------------------------------------------------
     # Utility helpers
     # ------------------------------------------------------------------
 
     def _load_pretrained(self, checkpoint_path: str, model=None):
-        """Load pretrained weights."""
+        """Load pretrained weights, including the diff_decoder→AR remap.
+
+        The diff_decoder→AR remap (TransfuserAgentAR._remap_diff_decoder_to_ar)
+        warm-starts the AR head's bev_deform_attn / e2a_attn / ego_attn / ffn /
+        norms from the original 88.1 PDMS DiffusionDrive trajectory head. Without
+        this remap, both policy and reference would each receive a fresh random
+        AR head — they'd start out DIFFERENT (different RNG draws), inflating
+        KL at step 0 and discarding the pretrained cross-attention knowledge.
+        """
         model = model or self.policy_model
         checkpoint = torch.load(checkpoint_path, map_location='cpu')
 
@@ -112,7 +183,11 @@ class GRPOTrainer(pl.LightningModule):
 
         new_state_dict = {}
         for k, v in state_dict.items():
-            if k.startswith('agent._transfuser_model.'):
+            if k.startswith('reference_model.'):
+                continue   # GRPO ckpts: reference is a frozen copy, skip
+            elif k.startswith('policy_model.'):
+                new_key = k[len('policy_model.'):]
+            elif k.startswith('agent._transfuser_model.'):
                 new_key = k[len('agent._transfuser_model.'):]
             elif k.startswith('_transfuser_model.'):
                 new_key = k[len('_transfuser_model.'):]
@@ -122,8 +197,18 @@ class GRPOTrainer(pl.LightningModule):
                 new_key = k
             new_state_dict[new_key] = v
 
+        # Apply diff_decoder→AR remap (no-op for ckpts that already use the
+        # AR head structure, e.g. SFT checkpoints from v3..v6).
+        new_state_dict = TransfuserAgentAR._remap_diff_decoder_to_ar(new_state_dict)
+
         missing, unexpected = model.load_state_dict(new_state_dict, strict=False)
-        print(f"Loaded checkpoint: {len(missing)} missing, {len(unexpected)} unexpected keys")
+        ar_head_total = sum(1 for k in model.state_dict() if k.startswith('_trajectory_head.'))
+        ar_head_missing = sum(1 for k in missing if k.startswith('_trajectory_head.'))
+        print(
+            f"GRPO load: AR head warm-started "
+            f"{ar_head_total - ar_head_missing}/{ar_head_total} tensors, "
+            f"{len(missing)} missing, {len(unexpected)} unexpected keys"
+        )
 
     def _freeze_model(self, model: nn.Module):
         for param in model.parameters():
@@ -232,9 +317,13 @@ class GRPOTrainer(pl.LightningModule):
                 ego_logits = ego_logits[0]  # → [T, V]
 
             # --- OLD log_probs from sampling-time logits ---
+            # Bug7 fix: scale logits by the sampling temperature so the stored
+            # log_prob matches the actual sampling distribution π(a|s, T).
+            # Without this, importance ratio π_new(a|T)/π_old(a|T=1) is biased.
             if ego_logits is not None and tokens is not None:
                 T_len = tokens.shape[0]
-                log_probs_dist = F.log_softmax(ego_logits, dim=-1)  # [T, V]
+                T_sample = self._safe_temperature(self.temperature)
+                log_probs_dist = F.log_softmax(ego_logits / T_sample, dim=-1)  # [T, V]
                 token_log_probs = log_probs_dist[
                     torch.arange(T_len, device=ego_logits.device), tokens
                 ]  # [T]
@@ -263,20 +352,30 @@ class GRPOTrainer(pl.LightningModule):
         """
         Compute PDM score for a predicted trajectory.
 
-        trajectory : [T, 3]  (x, y, heading) in ego frame.
-                     NOTE: The AR model sets heading=0 for all steps,
-                     which is incorrect for curved paths.  We fix this by
-                     estimating heading from consecutive (x, y) positions.
+        trajectory : [T, 3]  (x, y, heading) in ego frame, as returned by
+                     V2TransfuserModelAR. step_corners and trajectory_corners
+                     codebooks already produce a real heading; the legacy
+                     step_delta path with heading_head=False also returns
+                     atan2(local_delta) heading, which is sensible.
 
         Fixes applied
         -------------
-        Fix A: Heading estimated via atan2(dy, dx) instead of always 0.
-               Incorrect heading causes wrong ego-box orientation in PDM
-               simulation → false collision / drivable-area scores on curves.
         Fix B: TrajectorySampling derived from simulator.proposal_sampling
                instead of hardcoded (time_horizon=4, interval_length=0.1).
         Fix C: .float() before F.interpolate to guard against fp16 inputs.
         Fix D: poses cast to np.float32 matching Trajectory dtype spec.
+        Fix E (Bug8): Trust the model's predicted heading instead of
+               overwriting it with atan2(pos_diffs). The previous override
+               discarded the heading channel entirely — for step_corners or
+               heading_head=true models that channel is meaningful, and for
+               step_delta the model already stores atan2(local_delta) so the
+               override was redundant. As a defensive last resort we still
+               recompute heading via atan2 if the model channel is exactly
+               zero everywhere (e.g. an old step_delta model with no heading
+               head was loaded).
+        Bug9: PDM-scoring failures are tracked. Long silent streaks used to
+              collapse advantages to ~0 and stall training, so we raise after
+              `PDM_FAIL_RAISE_AFTER` consecutive failures.
         """
         if self.simulator is None or self.scorer is None:
             return 0.0
@@ -302,24 +401,19 @@ class GRPOTrainer(pl.LightningModule):
             else:
                 trajectory_3d = trajectory   # [target, 3]
 
-            # Fix A: estimate heading from consecutive (x, y) positions.
-            # The AR model stores heading=0 (column 2) because the codebook
-            # only encodes (dx, dy) step-wise displacements.  Using heading=0
-            # means relative_to_absolute_poses keeps the ego facing the INITIAL
-            # direction forever — wrong for curves.  atan2(dy, dx) gives a
-            # physically meaningful heading for each waypoint.
-            pos_xy = trajectory_3d[:, :2]                         # [N, 2]
-            if pos_xy.shape[0] > 1:
-                diffs      = pos_xy[1:] - pos_xy[:-1]             # [N-1, 2]
-                headings_t = torch.atan2(diffs[:, 1], diffs[:, 0])  # [N-1]
-                # Repeat first heading so shape stays [N]
-                headings_t = torch.cat([headings_t[:1], headings_t], dim=0)  # [N]
-            else:
-                headings_t = torch.zeros(pos_xy.shape[0], device=trajectory_3d.device)
-
-            trajectory_3d = torch.stack(
-                [pos_xy[:, 0], pos_xy[:, 1], headings_t], dim=1
-            )  # [N, 3]
+            # Fix E (Bug8): only fall back to atan2(pos_diffs) when the model
+            # truly produced no heading (all-zero channel). For step_corners /
+            # heading_head=true, trust the model's heading.
+            heading_channel = trajectory_3d[:, 2]
+            heading_is_dead = bool(heading_channel.abs().max().item() < 1e-6)
+            if heading_is_dead and trajectory_3d.shape[0] > 1:
+                pos_xy = trajectory_3d[:, :2]
+                diffs      = pos_xy[1:] - pos_xy[:-1]
+                headings_t = torch.atan2(diffs[:, 1], diffs[:, 0])
+                headings_t = torch.cat([headings_t[:1], headings_t], dim=0)
+                trajectory_3d = torch.stack(
+                    [pos_xy[:, 0], pos_xy[:, 1], headings_t], dim=1
+                )
 
             # Fix B: build TrajectorySampling from simulator params (not hardcoded)
             traj_sampling = TrajectorySampling(
@@ -340,10 +434,22 @@ class GRPOTrainer(pl.LightningModule):
                 simulator=self.simulator,
                 scorer=self.scorer,
             )
+            self.pdm_failure_streak = 0
             return float(pdm_result.score)
         except Exception as e:
-            print(f"[WARN] PDM scoring failed: {e}")
+            self.pdm_failure_streak += 1
+            self.pdm_failure_total  += 1
+            print(
+                f"[WARN] PDM scoring failed (streak={self.pdm_failure_streak}, "
+                f"total={self.pdm_failure_total}): {e}"
+            )
             import traceback; traceback.print_exc()
+            if self.pdm_failure_streak >= self.PDM_FAIL_RAISE_AFTER:
+                raise RuntimeError(
+                    f"PDM scoring failed {self.pdm_failure_streak} times in a row "
+                    f"(total {self.pdm_failure_total}). Aborting GRPO training "
+                    "before silent advantage collapse stalls everything."
+                )
             return 0.0
 
     # ------------------------------------------------------------------
@@ -417,45 +523,200 @@ class GRPOTrainer(pl.LightningModule):
         # a_0,...,a_{t-1} (via BOS-shifted teacher forcing), not on model's own
         # predictions.  This gives the correct π_θ(a_t | s, a_{<t}).
         with self._temporary_eval_mode(self.policy_model):
-            new_token_log_probs, new_logits = self.policy_model.compute_token_log_probs(
+            _, new_logits = self.policy_model.compute_token_log_probs(
                 batched_features, all_tokens
-            )  # [G, T], [G, T, V]
+            )  # _, [G, T, V]
 
         with torch.no_grad():
             with self._temporary_eval_mode(self.reference_model):
-                ref_token_log_probs, ref_logits = self.reference_model.compute_token_log_probs(
+                _, ref_logits = self.reference_model.compute_token_log_probs(
                     batched_features, all_tokens
-                )  # [G, T], [G, T, V]
+                )  # _, [G, T, V]
 
-        # Bug 4: PPO importance ratio w/ clipping
-        ratio         = torch.exp(new_token_log_probs - all_old_log_probs)  # [G, T]
-        ratio_clipped = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps)
+        # Bug7 fix: rebuild new/ref log_probs at SAMPLING temperature so they
+        # match `all_old_log_probs` (also stored at sampling T). The default
+        # token_log_probs returned by compute_token_log_probs are at unit T
+        # and would inject a temperature mismatch into the importance ratio.
+        T_sample = self._safe_temperature(self.temperature)
+        new_log_probs_all = F.log_softmax(new_logits / T_sample, dim=-1)   # [G, T, V]
+        ref_log_probs_all = F.log_softmax(ref_logits / T_sample, dim=-1)   # [G, T, V]
 
-        # [G] → [G, T] for token-level weighting
-        adv_expanded = valid_advantages.unsqueeze(1).expand_as(ratio)
+        new_token_log_probs = self._gather_token_log_probs(new_log_probs_all, all_tokens)  # [G, T]
 
-        # Bug 1 fix: .mean() over tokens (not .sum())
-        pg_loss = -torch.min(ratio * adv_expanded, ratio_clipped * adv_expanded).mean()
+        # ────────────────────────────────────────────────────────────────
+        # Algorithm dispatch: GRPO (token) / GSPO (sequence) / GSPO-token
+        # ────────────────────────────────────────────────────────────────
+        # Per-token log-ratio Δlog π_t = log π_new(a_t) − log π_old(a_t),
+        # both already at SAMPLING temperature (Bug7).
+        log_ratio_token = new_token_log_probs - all_old_log_probs            # [G, T]
 
-        # True categorical KL is more stable than sampled log-prob differences.
-        new_log_probs_all = F.log_softmax(new_logits, dim=-1)
-        ref_log_probs_all = F.log_softmax(ref_logits, dim=-1)
+        if self.algorithm == 'grpo':
+            # Token-level PPO clipping. ratio_t can swing wildly per token; we
+            # average the clipped surrogate over the T tokens.
+            ratio         = torch.exp(log_ratio_token)                       # [G, T]
+            ratio_clipped = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps)
+            adv_expanded  = valid_advantages.unsqueeze(1).expand_as(ratio)
+            pg_loss       = -torch.min(ratio * adv_expanded,
+                                       ratio_clipped * adv_expanded).mean()
+            ratio_for_log = ratio
+            clip_eps_used = self.clip_eps
+
+        elif self.algorithm == 'gspo':
+            # Qwen GSPO (arXiv:2507.18071): sequence-level importance ratio
+            # with length normalization. For our AR head, |y_i| = T = const.
+            #   s_i = exp((1/T) · Σ_t Δlog π_t)
+            # Clipping is applied to s_i directly, then averaged over the G
+            # sequences in the group. clip_eps_seq is much tighter than GRPO's
+            # token clip (paper reports 3e-4 ~ 4e-4 for sequence-level).
+            log_seq_ratio   = log_ratio_token.mean(dim=-1)                   # [G]
+            seq_ratio       = torch.exp(log_seq_ratio)                       # [G]
+            seq_ratio_clipd = torch.clamp(seq_ratio,
+                                          1.0 - self.clip_eps_seq,
+                                          1.0 + self.clip_eps_seq)
+            pg_loss = -torch.min(seq_ratio       * valid_advantages,
+                                 seq_ratio_clipd * valid_advantages).mean()
+            ratio_for_log = seq_ratio
+            clip_eps_used = self.clip_eps_seq
+
+        elif self.algorithm == 'gspo_token':
+            # Sequence-level importance ratio in VALUE, per-token gradient.
+            #   s_{i,t} = sg[s_i] · π_θ(y_t)/sg[π_θ(y_t)]  ≡ s_i (in value)
+            # Lets us mix GSPO's sequence-level clipping with per-token gradient
+            # routing — useful if per-token rewards/values are added later.
+            log_seq_ratio_sg = log_ratio_token.detach().mean(dim=-1)         # [G]   (sg[s_i] in log-space)
+            s_i_sg           = torch.exp(log_seq_ratio_sg)                   # [G]
+            # token-level factor that equals 1 in value but carries gradient
+            token_grad_factor = torch.exp(
+                new_token_log_probs - new_token_log_probs.detach()
+            )                                                                # [G, T]
+            s_it          = s_i_sg.unsqueeze(1) * token_grad_factor          # [G, T]
+            s_it_clipd    = torch.clamp(s_i_sg, 1.0 - self.clip_eps_seq,
+                                        1.0 + self.clip_eps_seq).unsqueeze(1) * token_grad_factor
+            adv_expanded  = valid_advantages.unsqueeze(1).expand_as(s_it)
+            pg_loss = -torch.min(s_it       * adv_expanded,
+                                 s_it_clipd * adv_expanded).mean()
+            ratio_for_log = s_i_sg
+            clip_eps_used = self.clip_eps_seq
+
+        else:  # 'grpo_plus'
+            # GRPO+ : GSPO sequence-level importance ratio (low variance) +
+            # hybrid sequence/token advantage. Designed for the trajectory-
+            # reward setting (PDMS) where:
+            #   - per-token importance ratio piles noise across T tokens
+            #     (handled by GSPO sequence-level ratio)
+            #   - sequence-only advantage flattens decision granularity — e.g.
+            #     obstacle avoidance affects only a few waypoints, but pure
+            #     GSPO gives every token in the rollout the same advantage
+            #     (handled by per-token attention weight derived from
+            #      group-divergence of predicted trajectories)
+            #
+            # Per-token weight w[i, t] = ||pos_xy[i,t] − mean(pos_xy[:,t])||
+            #                            normalized so mean over t equals 1.
+            # Tokens where rollout i diverged from the group mean are the
+            # "differentiating decisions" in this scene; combined with the
+            # signed sequence advantage A_seq[i] they form A_tok[i, t] which
+            # is positive on good decisions and negative on bad ones.
+
+            # ---- (a) Pure GSPO term (sequence ratio × sequence advantage) --
+            log_seq_ratio   = log_ratio_token.mean(dim=-1)                   # [G]
+            seq_ratio       = torch.exp(log_seq_ratio)
+            seq_ratio_clipd = torch.clamp(seq_ratio,
+                                          1.0 - self.clip_eps_seq,
+                                          1.0 + self.clip_eps_seq)
+            pg_seq = -torch.min(seq_ratio       * valid_advantages,
+                                seq_ratio_clipd * valid_advantages).mean()
+
+            # ---- (b) Per-token attention weight from rollout divergence ----
+            # Stack the predicted trajectories of the valid rollouts.
+            valid_trajs = torch.stack([
+                rollouts[i].trajectory.to(self.device, dtype=torch.float32)
+                for i in valid_idx
+            ])                                                               # [G, T, 3]
+            pos_xy = valid_trajs[..., :2]                                    # [G, T, 2]
+
+            if pos_xy.shape[0] >= 2:
+                mean_xy   = pos_xy.mean(dim=0, keepdim=True)                 # [1, T, 2]
+                divergence = (pos_xy - mean_xy).norm(dim=-1)                 # [G, T]
+                # Per-rollout normalization → mean weight over t equals 1.
+                # If a rollout matches the group mean exactly (zero divergence
+                # everywhere), fall back to a uniform weight of 1.
+                norm = divergence.mean(dim=-1, keepdim=True)                 # [G, 1]
+                uniform = torch.ones_like(divergence)
+                weight  = torch.where(
+                    norm > 1e-6,
+                    divergence / norm.clamp(min=1e-6),
+                    uniform,
+                )
+                # Cap extreme weights (defensive — shouldn't fire in practice).
+                weight = weight.clamp(max=5.0)
+            else:
+                # Group has only one valid rollout: no divergence signal.
+                weight = torch.ones_like(new_token_log_probs)                # [G, T]
+
+            A_tok = valid_advantages.unsqueeze(1) * weight                   # [G, T]
+
+            # ---- (c) Token-attention term (GSPO-token style routing) -------
+            s_i_sg = seq_ratio.detach()                                      # [G]
+            token_grad_factor = torch.exp(
+                new_token_log_probs - new_token_log_probs.detach()
+            )                                                                # [G, T]
+            s_it       = s_i_sg.unsqueeze(1) * token_grad_factor             # [G, T]
+            s_it_clipd = torch.clamp(s_i_sg, 1.0 - self.clip_eps_seq,
+                                     1.0 + self.clip_eps_seq).unsqueeze(1) * token_grad_factor
+            pg_tok = -torch.min(s_it       * A_tok,
+                                s_it_clipd * A_tok).mean()
+
+            # ---- (d) Convex combination ------------------------------------
+            alpha   = self.token_attention_alpha
+            pg_loss = (1.0 - alpha) * pg_seq + alpha * pg_tok
+
+            ratio_for_log = seq_ratio
+            clip_eps_used = self.clip_eps_seq
+
+        # True categorical KL on the SAMPLING-temperature distributions — more
+        # stable than sampled log-prob differences and aligned with the policy
+        # we are actually optimising (π(·|T)). Same KL term across algorithms.
         new_probs_all = new_log_probs_all.exp()
         kl_loss = (new_probs_all * (new_log_probs_all - ref_log_probs_all)).sum(dim=-1).mean()
 
         total_loss = pg_loss + self.kl_coef * kl_loss
 
+        # Fraction of sequences (or tokens for GRPO) that hit the clip. A non-
+        # trivial fraction is expected and acceptable in GSPO per the paper.
+        if self.algorithm == 'grpo':
+            clip_frac = ((torch.exp(log_ratio_token) - 1.0).abs() > self.clip_eps).float().mean()
+        else:
+            clip_frac = ((torch.exp(log_ratio_token.mean(dim=-1)) - 1.0).abs() > self.clip_eps_seq).float().mean()
+
         metrics = {
-            'grpo_loss':      total_loss.item(),
-            'policy_loss':    pg_loss.item(),
-            'kl_div':         kl_loss.item(),
-            'mean_reward':    mean_reward.item(),
-            'std_reward':     std_reward.item(),
-            'max_reward':     rewards.max().item(),
-            'min_reward':     rewards.min().item(),
-            'mean_ratio':     ratio.mean().item(),
-            'mean_advantage': valid_advantages.mean().item(),
+            f'{self.algorithm}_loss': total_loss.item(),
+            'policy_loss':            pg_loss.item(),
+            'kl_div':                 kl_loss.item(),
+            'mean_reward':            mean_reward.item(),
+            'std_reward':             std_reward.item(),
+            'max_reward':             rewards.max().item(),
+            'min_reward':             rewards.min().item(),
+            'mean_ratio':             ratio_for_log.mean().item(),
+            'std_ratio':              ratio_for_log.std(unbiased=False).item() if ratio_for_log.numel() > 1 else 0.0,
+            'clip_frac':              clip_frac.item(),
+            'clip_eps_used':          float(clip_eps_used),
+            'mean_advantage':         valid_advantages.mean().item(),
         }
+
+        # GRPO+ specific diagnostics: how much per-token weighting actually
+        # differentiates tokens. weight_dispersion = max/mean − 1 indicates
+        # how concentrated the attention is (0 = uniform, larger = focused).
+        if self.algorithm == 'grpo_plus':
+            metrics['token_attention_alpha'] = self.token_attention_alpha
+            try:
+                w_max  = weight.max(dim=-1).values.mean().item()
+                w_disp = max(w_max - 1.0, 0.0)
+                metrics['token_weight_max_mean']    = w_max
+                metrics['token_weight_dispersion']  = w_disp
+                metrics['pg_seq_term']              = pg_seq.item()
+                metrics['pg_tok_term']              = pg_tok.item()
+            except Exception:
+                pass
 
         return total_loss, metrics
 

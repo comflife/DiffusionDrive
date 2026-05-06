@@ -28,6 +28,7 @@ from navsim.agents.diffusiondrive.modules.scheduler import WarmupCosLR
 from omegaconf import DictConfig, OmegaConf, open_dict
 import torch.optim as optim
 import os
+import re
 import glob
 
 
@@ -140,30 +141,31 @@ class TransfuserAgentAR(AbstractAgent):
         self.init_from_pretrained()
 
     def init_from_pretrained(self):
-        """Initialize from pretrained checkpoint."""
-        import os
-        
+        """Initialize from pretrained checkpoint.
+
+        On top of standard prefix stripping, this also remaps the original
+        DiffusionDrive ``_trajectory_head.diff_decoder.layers.{i}.{module}.{x}``
+        keys onto the AR head's analogous module names, so the pretrained
+        88.1 PDMS cross-attention weights warm-start the AR cross-attentions
+        (bev_deform_attn / e2a_attn / ego_attn / ffn / norms) instead of being
+        discarded — they were structurally identical, only the names differed.
+        """
         if self._checkpoint_path and os.path.isfile(self._checkpoint_path):
             print(f"Loading pretrained checkpoint from: {self._checkpoint_path}")
             if torch.cuda.is_available():
                 checkpoint = torch.load(self._checkpoint_path)
             else:
                 checkpoint = torch.load(self._checkpoint_path, map_location=torch.device('cpu'))
-            
+
             state_dict = checkpoint['state_dict']
-            
-            # Remove common prefixes from checkpoint keys
-            # Handle both 'agent._transfuser_model.' and '_transfuser_model.' prefixes
-            # Also handle GRPO checkpoints which use 'policy_model.' prefix
+
+            # Strip framework prefixes (Lightning + GRPO/SFT pipeline variants).
             new_state_dict = {}
             for k, v in state_dict.items():
-                # Skip GRPO reference model (frozen copy, not needed for inference)
                 if k.startswith('reference_model.'):
                     continue
-                # Convert GRPO policy_model prefix
                 elif k.startswith('policy_model.'):
                     new_key = k[len('policy_model.'):]
-                # Remove 'agent._transfuser_model.' or '_transfuser_model.' prefix
                 elif k.startswith('agent._transfuser_model.'):
                     new_key = k[len('agent._transfuser_model.'):]
                 elif k.startswith('_transfuser_model.'):
@@ -173,18 +175,25 @@ class TransfuserAgentAR(AbstractAgent):
                 else:
                     new_key = k
                 new_state_dict[new_key] = v
-            
-            # Load state dict directly into the model (not the LightningModule wrapper)
-            missing_keys, unexpected_keys = self._transfuser_model.load_state_dict(new_state_dict, strict=False)
-            
+
+            new_state_dict = self._remap_diff_decoder_to_ar(new_state_dict)
+
+            model_sd = self._transfuser_model.state_dict()
+            missing_keys, unexpected_keys = self._transfuser_model.load_state_dict(
+                new_state_dict, strict=False)
+
+            ar_head_total = sum(1 for k in model_sd if k.startswith('_trajectory_head.'))
+            ar_head_missing = [k for k in missing_keys if k.startswith('_trajectory_head.')]
+            ar_head_loaded = ar_head_total - len(ar_head_missing)
+            print(
+                f"Pretrained load summary: "
+                f"AR head warm-started {ar_head_loaded}/{ar_head_total} tensors, "
+                f"{len(ar_head_missing)} random-init."
+            )
             if missing_keys:
-                print(f"Missing keys when loading pretrained weights: {len(missing_keys)} keys")
-                print(f"First 5 missing: {missing_keys[:5]}")
-                print("(This is expected for AR head parameters)")
+                print(f"  total missing: {len(missing_keys)} (sample: {missing_keys[:5]})")
             if unexpected_keys:
-                print(f"Unexpected keys when loading pretrained weights: {len(unexpected_keys)} keys")
-                if len(unexpected_keys) <= 10:
-                    print(f"Unexpected: {unexpected_keys}")
+                print(f"  total unexpected: {len(unexpected_keys)} (sample: {unexpected_keys[:5]})")
         else:
             if self._checkpoint_path:
                 print(f"Checkpoint not found at: {self._checkpoint_path}")
@@ -192,6 +201,69 @@ class TransfuserAgentAR(AbstractAgent):
 
         if getattr(self._config, "freeze_pretrained_trunk", False):
             self._freeze_pretrained_trunk()
+
+    @staticmethod
+    def _remap_diff_decoder_to_ar(sd: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """Map original DiffusionDrive trajectory-head keys to AR-head module names.
+
+        Original layout (per layer i ∈ {0,1}):
+            _trajectory_head.diff_decoder.layers.{i}.cross_bev_attention.{x}
+            _trajectory_head.diff_decoder.layers.{i}.cross_agent_attention.{x}
+            _trajectory_head.diff_decoder.layers.{i}.cross_ego_attention.{x}
+            _trajectory_head.diff_decoder.layers.{i}.ffn.{0|2}.{x}
+            _trajectory_head.diff_decoder.layers.{i}.norm{1|2|3}.{x}
+            _trajectory_head.diff_decoder.layers.{i}.{time_modulation,task_decoder}.{x}  -> dropped
+
+        AR layout target (per layer i):
+            _trajectory_head.bev_deform_attn.{i}.{x}    <- cross_bev_attention
+            _trajectory_head.e2a_attn.{i}.{x}           <- cross_agent_attention
+            _trajectory_head.ego_attn.{i}.{x}           <- cross_ego_attention   (only when use_ego_cross_attn)
+            _trajectory_head.ffn.{i}.{0,3}.{x}          <- ffn.{0,2} (AR ffn has Dropout at idx 2)
+            _trajectory_head.bev_deform_norm.{i}.{x}    <- norm1   (post-bev LN)
+            _trajectory_head.e2a_norm.{i}.{x}           <- norm1   (replicated; original norm1 was post-bev+post-agent)
+            _trajectory_head.ego_norm.{i}.{x}           <- norm2
+            _trajectory_head.ffn_norm.{i}.{x}           <- norm3
+
+        Targets that don't exist on the current model (e.g. bev_deform_attn when
+        use_deformable_bev=False) are silently filtered by load_state_dict's
+        strict=False — they show up in unexpected_keys, which is harmless.
+        """
+        pat = re.compile(r'^_trajectory_head\.diff_decoder\.layers\.(\d+)\.([^.]+)\.(.+)$')
+
+        def map_ffn(rest: str):
+            # Original ffn = [Linear, ReLU, Linear]; AR ffn = [Linear, GELU, Dropout, Linear, Dropout].
+            if rest.startswith('0.'):
+                return [('ffn', '0.' + rest[2:])]
+            if rest.startswith('2.'):
+                return [('ffn', '3.' + rest[2:])]
+            return []
+
+        def fixed_target(target):
+            return lambda rest: [(target, rest)]
+
+        rules = {
+            'cross_bev_attention':   fixed_target('bev_deform_attn'),
+            'cross_agent_attention': fixed_target('e2a_attn'),
+            'cross_ego_attention':   fixed_target('ego_attn'),
+            'ffn':                   map_ffn,
+            'norm1':                 lambda r: [('bev_deform_norm', r), ('e2a_norm', r)],
+            'norm2':                 fixed_target('ego_norm'),
+            'norm3':                 fixed_target('ffn_norm'),
+        }
+
+        new_sd: Dict[str, torch.Tensor] = {}
+        for k, v in sd.items():
+            m = pat.match(k)
+            if m is None:
+                new_sd[k] = v
+                continue
+            i, mod, rest = m.group(1), m.group(2), m.group(3)
+            rule = rules.get(mod)
+            if rule is None:
+                continue
+            for ar_mod, ar_rest in rule(rest):
+                new_sd[f'_trajectory_head.{ar_mod}.{i}.{ar_rest}'] = v
+        return new_sd
 
     def _freeze_pretrained_trunk(self):
         """Freeze the pretrained DiffusionDrive trunk and train AR trajectory head only."""
@@ -326,41 +398,16 @@ class TransfuserAgentAR(AbstractAgent):
         return {'optimizer': optimizer, 'lr_scheduler': scheduler}
 
     def get_coslr_optimizers(self):
-        # Head/trunk split: when trunk_lr_mult < 1.0, route all params NOT under
-        # `_trajectory_head.` to a low-lr group. This is the recommended setup
-        # for joint fine-tuning with a pretrained trunk + a fresh AR head.
-        trunk_lr_mult = float(getattr(self._config, "trunk_lr_mult", 1.0))
-        if trunk_lr_mult < 1.0:
-            head_params, trunk_params = [], []
-            for name, p in self._transfuser_model.named_parameters():
-                if not p.requires_grad:
-                    continue
-                if name.startswith("_trajectory_head"):
-                    head_params.append(p)
-                else:
-                    trunk_params.append(p)
-            head_lr  = self._lr
-            trunk_lr = self._lr * trunk_lr_mult
+        # Uniform LR policy: all params share the same base LR. The legacy
+        # paramwise rule (image_encoder × cfg_lr_mult) still applies for parity
+        # with the original DiffusionDrive recipe. The trunk_lr_mult head/trunk
+        # split has been removed — joint fine-tuning is simpler with one rate
+        # and the warm-started AR cross-attentions no longer need protection.
+        if float(getattr(self._config, "trunk_lr_mult", 1.0)) != 1.0:
             print(
-                f"[lr] head ({len(head_params)} tensors) lr={head_lr:.2e}  |  "
-                f"trunk ({len(trunk_params)} tensors) lr={trunk_lr:.2e}"
+                f"[lr] config.trunk_lr_mult={self._config.trunk_lr_mult} is ignored "
+                "(uniform LR policy now in effect)."
             )
-            # WarmupCosLR scales each group by `lr_scale` if present in group[0].
-            optimizer = torch.optim.AdamW(
-                [
-                    {"params": head_params,  "lr": head_lr,  "lr_scale": 1.0},
-                    {"params": trunk_params, "lr": trunk_lr, "lr_scale": trunk_lr_mult},
-                ],
-                weight_decay=self._config.weight_decay,
-            )
-            scheduler = WarmupCosLR(
-                optimizer=optimizer,
-                lr=self._lr,
-                min_lr=1e-6,
-                epochs=int(getattr(self._config, "cos_lr_epochs", 100)),
-                warmup_epochs=int(getattr(self._config, "cos_lr_warmup_epochs", 3)),
-            )
-            return {"optimizer": optimizer, "lr_scheduler": scheduler}
 
         optimizer_cfg = dict(
             type=self._config.optimizer_type,

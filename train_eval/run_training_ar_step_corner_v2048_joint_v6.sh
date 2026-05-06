@@ -4,9 +4,15 @@
 #   - v6 change: deformable BEV -> ON
 #   - AR deformable BEV now attends to the causal prefix trajectory, preserving
 #     the original DiffusionDrive intent of trajectory-conditioned spatial BEV lookup
-#   - backbone joint training (freeze=false), trunk_lr_mult=0.05
-# Hypothesis: keeping the original DiffusionDrive conditioning style while swapping
-# only the trajectory decoder to a discrete AR decoder improves planning fidelity.
+#   - AR head's bev_deform_attn / e2a_attn / ego_attn / ffn / norms are now
+#     warm-started from the original 88.1 PDMS diff_decoder.* weights via the
+#     init_from_pretrained remap (instead of random-initialized as in v3..v5)
+#   - agent_topk default bumped to 30 (== num_bounding_boxes) so AR matches
+#     the original cross_agent_attention K/V coverage
+#   - backbone joint training (freeze=false), uniform LR (no trunk lr split)
+# Hypothesis: keeping the original DiffusionDrive conditioning style + actually
+# inheriting its learned cross-attention weights while swapping only the
+# trajectory decoder to a discrete AR decoder improves planning fidelity.
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 export NAVSIM_DEVKIT_ROOT=/home/byounggun/DiffusionDrive
@@ -25,8 +31,9 @@ echo "Refinement  : residual delta ON, heading head OFF"
 echo "Agent       : step-aware nonlinear fusion"
 echo "Conditioning: per-layer ego cross-attn ON, deformable BEV ON"
 echo "BEV path    : causal prefix trajectory-conditioned deformable sampling"
-echo "Trunk       : joint training (freeze=false), lr x 0.05 (= 1e-5)"
-echo "Head        : full lr 2e-4"
+echo "Warm-start  : diff_decoder.cross_{bev,agent,ego}_attn / ffn / norms -> AR head"
+echo "Agent K/V   : agent_topk=30 (matches original cross_agent_attention)"
+echo "LR          : uniform 2e-4 across head + trunk (no trunk lr multiplier)"
 echo "Schedule    : 150 epochs, cosine LR matched to 150"
 echo "Snapshots   : milestone every 10 epochs starting from epoch 80"
 echo "GPUs        : $CUDA_VISIBLE_DEVICES"
@@ -40,7 +47,7 @@ python -m navsim.planning.script.run_training \
     trainer.params.max_epochs=150 \
     +trainer.params.devices=4 \
     trainer.params.strategy=ddp_find_unused_parameters_true \
-    dataloader.params.batch_size=32 \
+    dataloader.params.batch_size=64 \
     agent.lr=2e-4 \
     agent.checkpoint_path=/home/byounggun/DiffusionDrive/diffusiondrive_navsim_88p1_PDMS \
     agent.config.ego_vocab_size=2048 \
@@ -57,7 +64,6 @@ python -m navsim.planning.script.run_training \
     agent.config.ar_use_ego_cross_attn=true \
     agent.config.ar_use_deformable_bev=true \
     agent.config.ar_use_bev_pos_enc=true \
-    agent.config.trunk_lr_mult=0.05 \
     agent.config.freeze_pretrained_trunk=false \
     agent.config.cos_lr_epochs=150 \
     agent.config.ckpt_milestone_start=80 \

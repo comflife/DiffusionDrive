@@ -132,7 +132,7 @@ class TransfuserConfig:
     # Discrete AR specific configurations (for DiffusionDrive-AR)
     ego_vocab_size: int = 512  # Ego trajectory vocabulary size
     ego_vocab_path: str = ""   # Path to ego codebook .npy file
-    agent_topk: int = 8        # Number of top agents to use as context
+    agent_topk: int = 30       # Number of top agents to use as context (matches original DiffusionDrive cross_agent_attention K/V count)
     agent_context_dim: int = 256  # Dimension for agent continuous feature encoding
     temperature: float = 0.0   # Sampling temperature for AR decoding (0.0=greedy, >0=multinomial for diversity)
     ar_num_modes: int = 1      # Use a single AR policy stream for SFT / GRPO
@@ -159,10 +159,10 @@ class TransfuserConfig:
     # cycling back up after epoch == cos_lr_epochs).
     cos_lr_epochs: int = 100
     cos_lr_warmup_epochs: int = 3
-    # Per-group lr policy: when trunk_lr_mult < 1.0, all params NOT under
-    # `_trajectory_head.` get lr × trunk_lr_mult while AR head keeps full lr.
-    # This protects pretrained backbone/decoder during joint fine-tuning.
-    # Set to 1.0 to disable (default — uses legacy paramwise rule on image_encoder only).
+    # Deprecated: AR agent now always uses uniform LR (the legacy paramwise
+    # rule on image_encoder still applies). Kept for back-compat with older
+    # scripts that pass `agent.config.trunk_lr_mult=...` — the value is logged
+    # and ignored.
     trunk_lr_mult: float = 1.0
     freeze_pretrained_trunk: bool = True
     # optimizer=dict(

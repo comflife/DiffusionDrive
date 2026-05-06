@@ -1,8 +1,15 @@
 #!/bin/bash
 # Evaluate DiffusionDrive-AR joint_v6 milestone checkpoints and print PDMS.
-# v6 = v4 + deformable BEV ON (DiffusionDrive-style trajectory-conditioned BEV).
+# v6 = v4 + deformable BEV ON (DiffusionDrive-style trajectory-conditioned BEV)
+#       + AR cross-attentions warm-started from 88.1 PDMS diff_decoder.*
+#       + agent_topk=30 default (matches original cross_agent_attention K/V)
+#       + uniform LR (no trunk_lr_mult split).
 # Defaults to epoch 80, 90, ..., 150. Missing checkpoints fail the script unless
 # SKIP_MISSING=1 is set.
+# Note: ckpts trained BEFORE the recent code changes (bev_attn always registered,
+# agent_topk=8) will still load — bev_attn / bev_norm tensors land in
+# unexpected_keys (harmless) and the model uses the new agent_topk=30 default.
+# To reproduce the old eval behaviour exactly, set agent.config.agent_topk=8.
 
 set -euo pipefail
 
@@ -96,7 +103,6 @@ run_eval_one() {
         agent.config.ar_use_ego_cross_attn=true \
         agent.config.ar_use_deformable_bev=true \
         agent.config.ar_use_bev_pos_enc=true \
-        agent.config.trunk_lr_mult=0.05 \
         agent.config.freeze_pretrained_trunk=false \
         worker=ray_distributed \
         worker.threads_per_node="$WORKER_THREADS" \

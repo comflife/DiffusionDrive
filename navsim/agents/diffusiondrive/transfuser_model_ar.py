@@ -106,6 +106,15 @@ class DiscreteARTrajectoryHead(nn.Module):
 
         self._init_codebook()
 
+        # trajectory_corners is a whole-trajectory single-token codebook, so
+        # per-step deformable refs degenerate to zeros. Auto-disable so the
+        # conditional bev_attn / bev_deform_attn registration below picks the
+        # correct module.
+        if self.use_deformable_bev and self.codebook_mode == 'trajectory_corners':
+            print("[ar] codebook_mode='trajectory_corners' is incompatible with "
+                  "deformable BEV; auto-disabling and falling back to flat BEV.")
+            self.use_deformable_bev = False
+
         # Ego context projector
         self.ego_ctx_proj = nn.Sequential(
             nn.Linear(d_model, d_model),
@@ -160,15 +169,14 @@ class DiscreteARTrajectoryHead(nn.Module):
         ])
         self.e2a_norm = nn.ModuleList([nn.LayerNorm(d_model) for _ in range(self.num_layers)])
 
-        # 3. BEV cross-attention (global flatten — used when use_deformable_bev=False)
-        self.bev_attn = nn.ModuleList([
-            nn.MultiheadAttention(d_model, self.num_heads, dropout=self.dropout, batch_first=True)
-            for _ in range(self.num_layers)
-        ])
-        self.bev_norm = nn.ModuleList([nn.LayerNorm(d_model) for _ in range(self.num_layers)])
-
-        # 3b. Deformable BEV cross-attention (waypoint-aware, used when use_deformable_bev=True)
+        # 3. BEV cross-attention. Only one of the two paths is registered, to
+        # avoid carrying unused parameters through DDP / optimizer. Switching
+        # `use_deformable_bev` between runs requires a fresh init for the BEV
+        # path (the other path's weights wouldn't apply anyway).
         if self.use_deformable_bev:
+            # Waypoint-aware deformable sampling — direct analog of the original
+            # DiffusionDrive cross_bev_attention. Warm-started in
+            # transfuser_agent_ar.py via the diff_decoder→AR remap.
             self.bev_deform_attn = nn.ModuleList([
                 GridSampleCrossBEVAttention(
                     embed_dims=d_model,
@@ -181,6 +189,14 @@ class DiscreteARTrajectoryHead(nn.Module):
                 for _ in range(self.num_layers)
             ])
             self.bev_deform_norm = nn.ModuleList([nn.LayerNorm(d_model) for _ in range(self.num_layers)])
+        else:
+            # Global flatten BEV MHA fallback (no original DiffusionDrive analog;
+            # always trains from scratch).
+            self.bev_attn = nn.ModuleList([
+                nn.MultiheadAttention(d_model, self.num_heads, dropout=self.dropout, batch_first=True)
+                for _ in range(self.num_layers)
+            ])
+            self.bev_norm = nn.ModuleList([nn.LayerNorm(d_model) for _ in range(self.num_layers)])
 
         # 4. Per-layer ego cross-attention (recovers original diffusion conditioning)
         if self.use_ego_cross_attn:
@@ -957,14 +973,13 @@ class DiscreteARTrajectoryHead(nn.Module):
 
         ego_tokens = torch.stack(predicted_tokens, dim=2)    # [B, M, T]
         ego_logits = torch.stack(all_logits,        dim=2)   # [B, M, T, V]
-        # Final pass with full sequence for trajectory decoding (refines hidden states).
-        if self.use_deformable_bev:
-            # Build ref_pts from the FULL predicted sequence (now we know all tokens).
-            ref_pts = self._compute_ref_pts_from_tokens(ego_tokens, T)
-        ego_hidden = self._attn_stack(input_embs + step_e + role_e + mode_e,
-                                      agent_kv, bev_feat, topk_valid,
-                                      ref_pts=ref_pts, **ego_kw)
-        ego_pred_full = self._build_trajectory(ego_hidden, ego_tokens)
+        # Reuse hidden states from the final rollout iter for trajectory decoding.
+        # By the time iter T-1 runs, both input_embs and ref_pts are fully
+        # populated (positions 1..T-1 set during iters 0..T-2). The causal mask
+        # + lower-triangular point_mask guarantee each position k's hidden state
+        # only depends on data set during iters 0..k-1, so ego_out at the last
+        # iter is identical to a fresh teacher-forced pass — no need to re-run.
+        ego_pred_full = self._build_trajectory(ego_out, ego_tokens)
 
         return {
             'trajectory':       ego_pred_full[:, 0],
