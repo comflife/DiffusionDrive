@@ -147,9 +147,18 @@ class TransfuserConfig:
     ar_step_aware_agent: bool = False  # nonlinear (agent, step) fusion instead of additive step_emb
     ar_use_ego_cross_attn: bool = False  # per-layer cross-attn to ego_base (recovers original diffusion conditioning)
     ar_use_deformable_bev: bool = False  # waypoint-aware deformable BEV sampling instead of global flat attn
+    ar_use_bev_pos_enc: bool = False     # 2D sin-cos positional encoding on flat BEV K/V (UniAD/DETR-style)
     # Checkpoint policy
     ckpt_save_top_k: int = 3                       # how many epoch ckpts to retain
     ckpt_monitor: Optional[str] = "val/loss"       # set None to disable monitoring (keep last N by epoch)
+    # Milestone checkpoints — save at epoch ∈ {start, start+every, start+2*every, ...}
+    # in addition to the monitor-based top-k. Set start to -1 to disable.
+    ckpt_milestone_start: int = -1
+    ckpt_milestone_every: int = 10
+    # Cosine LR schedule length (must match trainer.max_epochs to avoid the cosine
+    # cycling back up after epoch == cos_lr_epochs).
+    cos_lr_epochs: int = 100
+    cos_lr_warmup_epochs: int = 3
     # Per-group lr policy: when trunk_lr_mult < 1.0, all params NOT under
     # `_trajectory_head.` get lr × trunk_lr_mult while AR head keeps full lr.
     # This protects pretrained backbone/decoder during joint fine-tuning.

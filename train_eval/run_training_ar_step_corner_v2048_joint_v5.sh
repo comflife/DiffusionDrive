@@ -1,12 +1,12 @@
 #!/bin/bash
-# Train DiffusionDrive-AR — JOINT trunk training v2 (with proper trunk LR):
-#   - based on heading_stepagent eval params (v2048 step_corners + heading head ON)
-#   - per-layer ego cross-attention ON
-#   - deformable BEV ON
-#   - backbone joint training (freeze=false)
-#   - trunk_lr_mult=0.05  → trunk gets lr×0.05 = 1e-5  while AR head keeps 2e-4
-#     This protects pretrained trunk during joint fine-tuning (lidar_encoder /
-#     transformers / tf_decoder no longer get hit with full 2e-4).
+# Train DiffusionDrive-AR — JOINT trunk training v5 (uniform LR ablation):
+#   - based on joint_v4 (v2048 step_corners + flat BEV + 2D pos enc + ego cross-attn)
+#   - v5 change: backbone/head use the same lr (no trunk lr multiplier)
+#   - deformable BEV  → OFF (back to global flat MHA)
+#   - 2D sin-cos BEV positional encoding → ON  (UniAD/DETR-style)
+#   - backbone joint training (freeze=false), uniform lr=2e-4
+# Hypothesis: removing the low-lr trunk split tests whether joint full-rate
+# optimization helps once ego cross-attn is already restored.
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 export NAVSIM_DEVKIT_ROOT=/home/byounggun/DiffusionDrive
@@ -18,14 +18,17 @@ export PYTHONPATH="$NAVSIM_DEVKIT_ROOT:$PYTHONPATH"
 
 cd $NAVSIM_DEVKIT_ROOT
 
-echo "Starting DiffusionDrive-AR step-corner v2048 JOINT v2 (low trunk lr)..."
+echo "Starting DiffusionDrive-AR step-corner v2048 JOINT v5 (flat BEV + 2D pos enc + ego cross-attn + uniform lr)..."
 echo "Codebook    : codebook_cache/navsim_kdisk_v2048_diffusiondrive/ego.npy  (V=2048, corner→[V,3])"
 echo "Mode        : step_corners"
-echo "Refinement  : residual delta ON, heading head ON"
+echo "Refinement  : residual delta ON, heading head OFF"
 echo "Agent       : step-aware nonlinear fusion"
-echo "Conditioning: per-layer ego cross-attn ON, deformable BEV ON"
-echo "Trunk       : joint training (freeze=false), lr × 0.05 (= 1e-5)"
+echo "Conditioning: per-layer ego cross-attn ON, deformable BEV OFF"
+echo "BEV pos enc : 2D sin-cos ON"
+echo "Trunk       : joint training (freeze=false), same lr as head"
 echo "Head        : full lr 2e-4"
+echo "Schedule    : 150 epochs, cosine LR matched to 150"
+echo "Snapshots   : milestone every 10 epochs starting from epoch 80"
 echo "GPUs        : $CUDA_VISIBLE_DEVICES"
 
 python -m navsim.planning.script.run_training \
@@ -33,8 +36,8 @@ python -m navsim.planning.script.run_training \
     train_test_split=navtrain \
     cache_path="/data2/byounggun/training_cache" \
     force_cache_computation=false \
-    +experiment_name=diffusiondrive_ar_step_corner_v2048_joint_v2 \
-    trainer.params.max_epochs=100 \
+    +experiment_name=diffusiondrive_ar_step_corner_v2048_joint_v5 \
+    trainer.params.max_epochs=150 \
     +trainer.params.devices=4 \
     trainer.params.strategy=ddp_find_unused_parameters_true \
     dataloader.params.batch_size=64 \
@@ -49,13 +52,17 @@ python -m navsim.planning.script.run_training \
     agent.config.ar_traj_loss_weight=8.0 \
     agent.config.ar_heading_loss_weight=2.0 \
     agent.config.ar_use_residual_delta=true \
-    agent.config.ar_use_heading_head=true \
+    agent.config.ar_use_heading_head=false \
     agent.config.ar_step_aware_agent=true \
     agent.config.ar_use_ego_cross_attn=true \
-    agent.config.ar_use_deformable_bev=true \
-    agent.config.trunk_lr_mult=0.05 \
+    agent.config.ar_use_deformable_bev=false \
+    agent.config.ar_use_bev_pos_enc=true \
     agent.config.freeze_pretrained_trunk=false \
-    output_dir=/data2/byounggun/diffusiondrive_ar_output/step_corner_v2048_joint_v2 \
+    agent.config.cos_lr_epochs=150 \
+    agent.config.ckpt_milestone_start=80 \
+    agent.config.ckpt_milestone_every=10 \
+    output_dir=/data2/byounggun/diffusiondrive_ar_output/step_corner_v2048_joint_v5 \
     wandb.enabled=true \
     wandb.project="diffusiondrive-ar" \
-    wandb.name="diffusiondrive_ar_step_corner_v2048_joint_v2"
+    wandb.name="diffusiondrive_ar_step_corner_v2048_joint_v5" \
+    "$@"

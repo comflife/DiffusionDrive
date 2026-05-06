@@ -68,13 +68,15 @@ class GridSampleCrossBEVAttention(nn.Module):
         nn.init.constant_(self.output_proj.bias, 0)
 
 
-    def forward(self, queries, traj_points, bev_feature, spatial_shape):
+    def forward(self, queries, traj_points, bev_feature, spatial_shape, point_mask=None):
         """
         Args:
             queries: input features with shape of (bs, num_queries, embed_dims)
             traj_points: trajectory points with shape of (bs, num_queries, num_points, 2)
             bev_feature: bev features with shape of (bs, embed_dims, height, width)
             spatial_shapes: (height, width)
+            point_mask: optional bool mask with shape of (bs, num_queries, num_points)
+                where True means the sampled point is valid for that query.
 
         """
 
@@ -88,7 +90,12 @@ class GridSampleCrossBEVAttention(nn.Module):
         normalized_trajectory = normalized_trajectory[..., [1, 0]]  # Swap x and y
         
         attention_weights = self.attention_weights(queries)
-        attention_weights = attention_weights.view(bs, num_queries, num_points).softmax(-1)
+        attention_weights = attention_weights.view(bs, num_queries, num_points)
+        if point_mask is not None:
+            attention_weights = attention_weights.masked_fill(
+                ~point_mask, torch.finfo(attention_weights.dtype).min
+            )
+        attention_weights = attention_weights.softmax(-1)
 
         value = self.value_proj(bev_feature)
         grid = normalized_trajectory.view(bs, num_queries, num_points, 2)

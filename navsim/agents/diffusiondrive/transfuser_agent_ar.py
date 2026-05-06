@@ -45,11 +45,15 @@ class RollingLastNCheckpoint(pl.Callback):
         self.filename_template = filename_template
 
     def on_train_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
+        os.makedirs(self.dirpath, exist_ok=True)
+        epoch = trainer.current_epoch
+        path = os.path.join(self.dirpath, self.filename_template.format(epoch=epoch))
+
+        # In DDP, all ranks must enter Lightning's checkpoint path because the
+        # strategy may perform collective synchronization internally.
+        trainer.save_checkpoint(path)
+
         if trainer.is_global_zero:
-            os.makedirs(self.dirpath, exist_ok=True)
-            epoch = trainer.current_epoch
-            path = os.path.join(self.dirpath, self.filename_template.format(epoch=epoch))
-            trainer.save_checkpoint(path)
             existing = sorted(glob.glob(os.path.join(self.dirpath, "epoch_*.ckpt")))
             while len(existing) > self.n:
                 old = existing.pop(0)
@@ -57,6 +61,40 @@ class RollingLastNCheckpoint(pl.Callback):
                     os.remove(old)
                 except OSError:
                     pass
+
+
+class MilestoneEpochCheckpoint(pl.Callback):
+    """Save a checkpoint at epoch ∈ {start, start+every, start+2*every, ...}.
+
+    Independent of monitor/top-k logic — runs alongside ModelCheckpoint to
+    preserve fixed-cadence snapshots for late-stage analysis.
+    """
+
+    def __init__(
+        self,
+        dirpath: str,
+        start_epoch: int,
+        every_n: int = 10,
+        filename_template: str = "milestone_epoch_{epoch:03d}.ckpt",
+    ):
+        super().__init__()
+        self.dirpath = dirpath
+        self.start_epoch = start_epoch
+        self.every_n = max(1, every_n)
+        self.filename_template = filename_template
+
+    def on_train_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
+        epoch = trainer.current_epoch
+        if epoch < self.start_epoch:
+            return
+        if (epoch - self.start_epoch) % self.every_n != 0:
+            return
+        os.makedirs(self.dirpath, exist_ok=True)
+        path = os.path.join(self.dirpath, self.filename_template.format(epoch=epoch))
+
+        # In DDP, all ranks must enter Lightning's checkpoint path because the
+        # strategy may perform collective synchronization internally.
+        trainer.save_checkpoint(path)
 
 
 def build_from_configs(obj, cfg: DictConfig, **kwargs):
@@ -319,8 +357,8 @@ class TransfuserAgentAR(AbstractAgent):
                 optimizer=optimizer,
                 lr=self._lr,
                 min_lr=1e-6,
-                epochs=100,
-                warmup_epochs=3,
+                epochs=int(getattr(self._config, "cos_lr_epochs", 100)),
+                warmup_epochs=int(getattr(self._config, "cos_lr_warmup_epochs", 3)),
             )
             return {"optimizer": optimizer, "lr_scheduler": scheduler}
 
@@ -370,8 +408,8 @@ class TransfuserAgentAR(AbstractAgent):
             optimizer=optimizer,
             lr=self._lr,
             min_lr=1e-6,
-            epochs=100,
-            warmup_epochs=3,
+            epochs=int(getattr(self._config, "cos_lr_epochs", 100)),
+            warmup_epochs=int(getattr(self._config, "cos_lr_warmup_epochs", 3)),
         )
         
         if 'interval' in scheduler_cfg:
@@ -401,4 +439,15 @@ class TransfuserAgentAR(AbstractAgent):
                 every_n_epochs=1,
             )
 
-        return [TransfuserCallback(self._config), checkpoint_callback]
+        callbacks: List[pl.Callback] = [TransfuserCallback(self._config), checkpoint_callback]
+
+        # Optional: fixed-cadence milestone checkpoints (e.g. epoch 80, 90, 100, ...).
+        ms_start = int(getattr(self._config, "ckpt_milestone_start", -1))
+        ms_every = int(getattr(self._config, "ckpt_milestone_every", 10))
+        if ms_start >= 0:
+            ms_dir = self._checkpoint_save_dir or "lightning_logs/checkpoints"
+            callbacks.append(
+                MilestoneEpochCheckpoint(dirpath=ms_dir, start_epoch=ms_start, every_n=ms_every)
+            )
+
+        return callbacks

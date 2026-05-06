@@ -98,6 +98,7 @@ class DiscreteARTrajectoryHead(nn.Module):
         self.use_step_aware_agent = getattr(config, 'ar_step_aware_agent', False)
         self.use_ego_cross_attn   = getattr(config, 'ar_use_ego_cross_attn', False)
         self.use_deformable_bev   = getattr(config, 'ar_use_deformable_bev', False)
+        self.use_bev_pos_enc      = getattr(config, 'ar_use_bev_pos_enc', False)
 
         # Ego vocabulary
         self.ego_vocab_size = getattr(config, 'ego_vocab_size', 512)
@@ -174,7 +175,7 @@ class DiscreteARTrajectoryHead(nn.Module):
                     num_heads=self.num_heads,
                     num_levels=1,
                     in_bev_dims=d_model,    # cross_bev_feature is already d_model dim
-                    num_points=1,           # one ref point per AR query position
+                    num_points=num_poses,   # causal prefix trajectory per AR query position
                     config=config,
                 )
                 for _ in range(self.num_layers)
@@ -324,13 +325,14 @@ class DiscreteARTrajectoryHead(nn.Module):
         tokens: torch.Tensor,   # [B, M, T] full token sequence
         T: int,
     ) -> torch.Tensor:
-        """Reference points (BEV xy) per AR query position, derived from already-decoded tokens.
+        """Reference trajectory starts (BEV xy) per AR step, derived from decoded tokens.
 
         ref[t] = cumulative ego position at the START of step t
                = sum of decoded actions for tokens 0..t-1
         ref[0] = (0, 0)
 
-        Causal-safe: position t's ref depends only on tokens 0..t-1.
+        Causal-safe: step t depends only on tokens 0..t-1. During deformable BEV
+        attention, query t is allowed to attend to the prefix refs ref[0..t].
         """
         B, M = tokens.shape[:2]
         device = tokens.device
@@ -403,6 +405,47 @@ class DiscreteARTrajectoryHead(nn.Module):
     @staticmethod
     def _wrap_angle(angle: torch.Tensor) -> torch.Tensor:
         return torch.atan2(torch.sin(angle), torch.cos(angle))
+
+    @staticmethod
+    def _build_2d_sincos_pos_enc(
+        H: int, W: int, D: int,
+        device: torch.device, dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """DETR-style 2D sin-cos positional encoding for an H×W grid.
+
+        D is split into 4 quarters: (sin_y, cos_y, sin_x, cos_x).
+        Returns a [H*W, D] tensor.
+        """
+        if D % 4 != 0:
+            raise ValueError(f"D must be divisible by 4 for 2D sin-cos pos enc, got D={D}")
+        Dq = D // 4
+        omega = torch.arange(Dq, device=device, dtype=dtype) / Dq
+        omega = 1.0 / (10000 ** omega)                             # [Dq]
+        y, x = torch.meshgrid(
+            torch.arange(H, device=device, dtype=dtype),
+            torch.arange(W, device=device, dtype=dtype),
+            indexing='ij',
+        )
+        pos_y = y.flatten()[:, None] * omega[None, :]              # [HW, Dq]
+        pos_x = x.flatten()[:, None] * omega[None, :]              # [HW, Dq]
+        return torch.cat([pos_y.sin(), pos_y.cos(),
+                          pos_x.sin(), pos_x.cos()], dim=-1)       # [HW, D]
+
+    def _make_bev_kv(self, bev_2d: torch.Tensor) -> torch.Tensor:
+        """[B, D, H, W] → [B, P, D] via bev_proj (+ optional 2D sin-cos pos enc).
+
+        Centralised so that forward() and compute_token_log_probs() apply the
+        identical preprocessing — important for GRPO importance ratio correctness.
+        """
+        B, D, H, W = bev_2d.shape
+        bev_flat = bev_2d.flatten(2).permute(0, 2, 1)              # [B, P, D]
+        bev_feat = self.bev_proj(bev_flat)
+        if self.use_bev_pos_enc:
+            pos_enc = self._build_2d_sincos_pos_enc(
+                H, W, D, bev_feat.device, bev_feat.dtype,
+            )                                                       # [P, D]
+            bev_feat = bev_feat + pos_enc.unsqueeze(0)
+        return bev_feat
 
     def _build_trajectory(
         self,
@@ -599,7 +642,7 @@ class DiscreteARTrajectoryHead(nn.Module):
         ego_base:  Optional[torch.Tensor] = None,           # [B, D] — for per-layer ego cross-attn
         bev_2d:    Optional[torch.Tensor] = None,           # [B, D, H, W] — for deformable
         bev_spatial_shape: Optional[Tuple[int, int]] = None,
-        ref_pts:   Optional[torch.Tensor] = None,           # [B, M, T, 2]
+        ref_pts:   Optional[torch.Tensor] = None,           # [B, M, T, 2] step-start xy refs
     ) -> torch.Tensor:
         """AR attention stack."""
         B, M, T, D = ego_q.shape
@@ -655,10 +698,23 @@ class DiscreteARTrajectoryHead(nn.Module):
                 # Expand bev_2d to B*M batch (replicate per mode)
                 bev_2d_bm = (bev_2d.unsqueeze(1).expand(-1, M, -1, -1, -1)
                              .reshape(B * M, *bev_2d.shape[1:]))
-                # ref_pts [B, M, T, 2] → [B*M, T, num_points=1, 2]
-                ref_pts_bm = ref_pts.reshape(B * M, T, 1, 2)
-                # GridSampleCrossBEVAttention internally does residual + dropout
-                out = self.bev_deform_attn[i](eg_MT, ref_pts_bm, bev_2d_bm, bev_spatial_shape)
+                # Query t attends to the causal prefix trajectory refs ref[0..t].
+                ref_pts_bm = (
+                    ref_pts.unsqueeze(2)
+                    .expand(-1, -1, T, -1, -1)
+                    .reshape(B * M, T, T, 2)
+                )
+                ref_mask_bm = torch.tril(
+                    torch.ones(T, T, device=ref_pts.device, dtype=torch.bool)
+                ).unsqueeze(0).expand(B * M, -1, -1)
+                # GridSampleCrossBEVAttention internally does residual + dropout.
+                out = self.bev_deform_attn[i](
+                    eg_MT,
+                    ref_pts_bm,
+                    bev_2d_bm,
+                    bev_spatial_shape,
+                    point_mask=ref_mask_bm,
+                )
                 ego_q = self.bev_deform_norm[i](out).reshape(B, M, T, D)
             else:
                 eg_MT = ego_q.reshape(B * M, T, D)
@@ -1042,8 +1098,8 @@ class DiscreteARTrajectoryHead(nn.Module):
         D  = self._d_model
         device = ego_query.device
 
-        bev_flat = bev_feature.flatten(2).permute(0, 2, 1)   # [B, H*W, D]
-        bev_feat = self.bev_proj(bev_flat)
+        # Centralised flat BEV K/V construction (proj + optional 2D sin-cos pos enc).
+        bev_feat = self._make_bev_kv(bev_feature)             # [B, P, D]
         # Keep raw 2D for deformable BEV sampling (waypoint-aware)
         bev_2d = bev_feature                                  # [B, D, H, W]
         bev_spatial_shape = bev_feature.shape[2:]             # (H, W)
@@ -1277,11 +1333,10 @@ class V2TransfuserModelAR(nn.Module):
 
         agent_kv = self._trajectory_head._build_agent_kv(agent_enc, T)
 
-        # BEV features
+        # BEV features (shared helper guarantees identical preprocessing as forward())
         bev_2d = bb['cross_bev_feature']                                # [B, D, H, W]
         bev_spatial_shape = bev_2d.shape[2:]
-        bev_flat = bev_2d.flatten(2).permute(0, 2, 1)                   # [B, P, D]
-        bev_feat = self._trajectory_head.bev_proj(bev_flat)
+        bev_feat = self._trajectory_head._make_bev_kv(bev_2d)           # [B, P, D]
 
         # Ego context
         ego_ctx  = bb['trajectory_query'][:, 0, :]

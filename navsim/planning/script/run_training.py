@@ -151,10 +151,14 @@ def main(cfg: DictConfig) -> None:
     )
 
     logger.info("Starting Training")
+    resume_ckpt_path = cfg.get("resume_ckpt_path", None)
+    if resume_ckpt_path:
+        logger.info("Resuming training from checkpoint: %s", resume_ckpt_path)
     trainer.fit(
         model=lightning_module,
         train_dataloaders=train_dataloader,
         val_dataloaders=val_dataloader,
+        ckpt_path=resume_ckpt_path,
     )
 
 
