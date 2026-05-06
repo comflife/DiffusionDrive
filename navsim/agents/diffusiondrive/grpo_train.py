@@ -101,33 +101,39 @@ def main(cfg: DictConfig):
         kl_coef=cfg.get('kl_coef', 0.01),
         temperature=cfg.get('temperature', 1.0),
         clip_eps=cfg.get('clip_eps', 0.2),                       # GRPO token-level clip
-        algorithm=cfg.get('algorithm', 'grpo'),                  # 'grpo' | 'gspo' | 'gspo_token' | 'grpo_plus'
+        algorithm=cfg.get('algorithm', 'grpo'),                  # 'grpo' | 'dr_grpo' | 'gspo' | 'gspo_token' | 'grpo_plus'
         clip_eps_seq=cfg.get('clip_eps_seq', 4e-4),              # GSPO / GRPO+ sequence-level clip
         token_attention_alpha=cfg.get('token_attention_alpha', 0.5),  # GRPO+ blend
     )
 
     # Setup callbacks.
-    # Goal: keep only the latest N epoch ckpts + an explicit `last.ckpt`.
+    # Two saving modes:
+    #   • epoch-based (default): save every epoch, keep latest N
+    #   • step-based:            ++save_every_n_steps=300  → save every 300
+    #                            optimizer steps, keep latest N
     # PL's ModelCheckpoint requires a `monitor` whenever save_top_k>0, and RL
     # fine-tuning has no clean monotonic train signal worth picking "best" by.
-    # So we save every epoch (save_top_k=-1) and prune older files via a tiny
-    # callback that runs after each save.
-    keep_last_n = int(cfg.get('keep_last_n_ckpts', 3))
+    # So we save every interval (save_top_k=-1) and prune older files via a
+    # tiny callback that runs after each potential save.
+    keep_last_n         = int(cfg.get('keep_last_n_ckpts', 3))
+    save_every_n_steps  = cfg.get('save_every_n_steps', None)
+    save_every_n_steps  = int(save_every_n_steps) if save_every_n_steps else None
     ckpt_dir = Path(cfg.output_dir) / "checkpoints"
 
     class _KeepLastNCkpts(pl.callbacks.Callback):
-        """Delete all but the most recent `keep_n` epoch ckpts after each epoch.
+        """Delete all but the most recent `keep_n` ckpts in `dirpath`.
         Preserves `last.ckpt` (managed separately by ModelCheckpoint)."""
 
-        def __init__(self, dirpath: Path, keep_n: int):
-            self.dirpath = Path(dirpath)
-            self.keep_n = keep_n
+        def __init__(self, dirpath: Path, keep_n: int, every_n_steps=None):
+            self.dirpath       = Path(dirpath)
+            self.keep_n        = keep_n
+            self.every_n_steps = every_n_steps  # None → prune at epoch end
 
-        def on_train_epoch_end(self, trainer, pl_module):
+        def _prune(self, trainer):
             if not trainer.is_global_zero:
                 return
-            # Match any ModelCheckpoint output (e.g. grpo-00.ckpt or
-            # grpo-epoch=00.ckpt depending on PL version), but never touch
+            # Match any ModelCheckpoint output (e.g. grpo-00.ckpt,
+            # grpo-epoch=00.ckpt, grpo-step=000300.ckpt) but never touch
             # last.ckpt — that one is owned by ModelCheckpoint.
             ckpts = [p for p in self.dirpath.glob("grpo-*.ckpt") if p.name != "last.ckpt"]
             ckpts.sort(key=lambda p: p.stat().st_mtime)
@@ -137,15 +143,41 @@ def main(cfg: DictConfig):
                 except OSError:
                     pass
 
-    callbacks = [
-        pl.callbacks.ModelCheckpoint(
+        def on_train_epoch_end(self, trainer, pl_module):
+            if self.every_n_steps is None:
+                self._prune(trainer)
+
+        def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+            if self.every_n_steps is not None and (trainer.global_step + 1) % self.every_n_steps == 0:
+                self._prune(trainer)
+
+    if save_every_n_steps is not None:
+        # Step-based: PL's {step} placeholder auto-prepends "step=" itself,
+        # so the template must NOT contain a literal `step=` (otherwise the
+        # filename ends up as grpo-step=step=000200.ckpt).
+        ckpt_cb = pl.callbacks.ModelCheckpoint(
+            dirpath=ckpt_dir,
+            filename='grpo-{step:06d}',     # → grpo-step=000200.ckpt
+            save_top_k=-1,
+            every_n_train_steps=save_every_n_steps,
+            save_last=True,
+        )
+        print(f"[grpo_train] Saving ckpt every {save_every_n_steps} steps "
+              f"(keep latest {keep_last_n} + last.ckpt)")
+    else:
+        # Epoch-based (default)
+        ckpt_cb = pl.callbacks.ModelCheckpoint(
             dirpath=ckpt_dir,
             filename='grpo-{epoch:02d}',
-            save_top_k=-1,            # save every epoch; pruning handled below
+            save_top_k=-1,
             every_n_epochs=1,
-            save_last=True,           # also keep an explicit `last.ckpt`
-        ),
-        _KeepLastNCkpts(ckpt_dir, keep_last_n),
+            save_last=True,
+        )
+        print(f"[grpo_train] Saving ckpt every epoch (keep latest {keep_last_n} + last.ckpt)")
+
+    callbacks = [
+        ckpt_cb,
+        _KeepLastNCkpts(ckpt_dir, keep_last_n, every_n_steps=save_every_n_steps),
         pl.callbacks.LearningRateMonitor(logging_interval='step'),
     ]
 

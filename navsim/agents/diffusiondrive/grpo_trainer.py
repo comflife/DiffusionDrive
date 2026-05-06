@@ -85,7 +85,7 @@ class GRPOTrainer(pl.LightningModule):
         kl_coef: float = 0.01,  # KL penalty coefficient
         temperature: float = 1.0,  # sampling temperature
         clip_eps: float = 0.2,  # PPO clipping epsilon (GRPO token-level)
-        algorithm: str = 'grpo',     # 'grpo' | 'gspo' | 'gspo_token' | 'grpo_plus'
+        algorithm: str = 'grpo',     # 'grpo' | 'dr_grpo' | 'gspo' | 'gspo_token' | 'grpo_plus'
         clip_eps_seq: float = 4e-4,  # sequence-level clipping eps for GSPO / GRPO+
         token_attention_alpha: float = 0.5,  # GRPO+: blend (1-α)·GSPO + α·token-attn
         max_grad_norm: float = 1.0,
@@ -94,9 +94,9 @@ class GRPOTrainer(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters()
 
-        if algorithm not in ('grpo', 'gspo', 'gspo_token', 'grpo_plus'):
+        if algorithm not in ('grpo', 'dr_grpo', 'gspo', 'gspo_token', 'grpo_plus'):
             raise ValueError(
-                "algorithm must be one of 'grpo', 'gspo', 'gspo_token', 'grpo_plus'; "
+                "algorithm must be one of 'grpo', 'dr_grpo', 'gspo', 'gspo_token', 'grpo_plus'; "
                 f"got {algorithm!r}"
             )
         if not (0.0 <= float(token_attention_alpha) <= 1.0):
@@ -561,6 +561,30 @@ class GRPOTrainer(pl.LightningModule):
             ratio_for_log = ratio
             clip_eps_used = self.clip_eps
 
+        elif self.algorithm == 'dr_grpo':
+            # Dr. GRPO (arXiv:2503.20783) — "GRPO Done Right".
+            # Removes two normalization biases from vanilla GRPO:
+            #   • std-norm in advantage  ⇒  A_i = r_i − mean(r)   (no /std)
+            #     Vanilla GRPO's /std penalises groups where the policy is
+            #     already strong (low variance) by squashing their gradient,
+            #     and amplifies noise on high-variance groups.
+            #   • length-norm 1/|o_i| in loss  ⇒  Σ_t (no /T)
+            #     Biases against long correct rollouts (and toward long
+            #     incorrect ones). In our setting T=8 is constant per
+            #     trajectory so this is just a constant 8× scale absorbed by
+            #     LR — but kept for definitional correctness.
+            # Token-level PPO clipping is preserved (same as vanilla GRPO).
+            raw_advantages = (rewards - mean_reward).clamp(-5.0, 5.0)        # [N], no /std
+            valid_raw_adv  = raw_advantages[valid_idx]                       # [G]
+            ratio         = torch.exp(log_ratio_token)                       # [G, T]
+            ratio_clipped = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps)
+            adv_expanded  = valid_raw_adv.unsqueeze(1).expand_as(ratio)
+            # SUM over T (no length normalization), MEAN over G.
+            pg_loss       = -torch.min(ratio * adv_expanded,
+                                       ratio_clipped * adv_expanded).sum(dim=1).mean()
+            ratio_for_log = ratio
+            clip_eps_used = self.clip_eps
+
         elif self.algorithm == 'gspo':
             # Qwen GSPO (arXiv:2507.18071): sequence-level importance ratio
             # with length normalization. For our AR head, |y_i| = T = const.
@@ -683,7 +707,7 @@ class GRPOTrainer(pl.LightningModule):
 
         # Fraction of sequences (or tokens for GRPO) that hit the clip. A non-
         # trivial fraction is expected and acceptable in GSPO per the paper.
-        if self.algorithm == 'grpo':
+        if self.algorithm in ('grpo', 'dr_grpo'):
             clip_frac = ((torch.exp(log_ratio_token) - 1.0).abs() > self.clip_eps).float().mean()
         else:
             clip_frac = ((torch.exp(log_ratio_token.mean(dim=-1)) - 1.0).abs() > self.clip_eps_seq).float().mean()
@@ -702,6 +726,14 @@ class GRPOTrainer(pl.LightningModule):
             'clip_eps_used':          float(clip_eps_used),
             'mean_advantage':         valid_advantages.mean().item(),
         }
+
+        # Dr. GRPO actually optimises the un-std-normalised advantage; expose
+        # it explicitly so wandb shows the magnitude that drives the gradient.
+        if self.algorithm == 'dr_grpo':
+            metrics['mean_raw_advantage'] = valid_raw_adv.mean().item()
+            metrics['std_raw_advantage']  = (
+                valid_raw_adv.std(unbiased=False).item() if valid_raw_adv.numel() > 1 else 0.0
+            )
 
         # GRPO+ specific diagnostics: how much per-token weighting actually
         # differentiates tokens. weight_dispersion = max/mean − 1 indicates
