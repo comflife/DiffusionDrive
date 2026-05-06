@@ -20,7 +20,7 @@ export NAVSIM_EXP_ROOT=/data/navsim/exp/bg
 export OPENSCENE_DATA_ROOT=/data/navsim/dataset
 export NUPLAN_MAPS_ROOT=/data/navsim/dataset/maps
 export TMPDIR=/data2/byounggun/ray_tmp
-export PYTHONPATH="$NAVSIM_DEVKIT_ROOT:$PYTHONPATH"
+export PYTHONPATH="$NAVSIM_DEVKIT_ROOT:${PYTHONPATH:-}"
 
 # ── Pick a base checkpoint ────────────────────────────────────────────────
 # Priority: $BASE_CKPT env var > latest v6 milestone > v6 last.ckpt > error

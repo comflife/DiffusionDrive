@@ -1,23 +1,18 @@
 #!/bin/bash
-# GSPO (Group Sequence Policy Optimization, Qwen 2025-07) fine-tuning on
-# top of the v6 SFT checkpoint.
+# GSPO (Qwen Group Sequence Policy Optimization) fine-tuning on the v5 SFT ckpt.
 #
-# GSPO vs GRPO (one-line summary):
-#   - GRPO: per-token importance ratio, PPO clip ε ≈ 0.2
-#   - GSPO: per-sequence importance ratio with length normalization
-#           s_i = exp((1/T) · Σ_t [log π_new(a_t|s, a_<t) − log π_old(a_t|s, a_<t)])
-#           Clip applied to s_i directly, ε_seq ≈ 3e-4 ~ 4e-4
-#           (~500x tighter than GRPO because s_i is concentrated near 1).
-#   Why: token-level ratios are noisier and produce wasted off-policy gradient,
-#        especially for long sequences. Sequence-level ratio aligns the
-#        importance correction with the granularity of the reward (per-rollout
-#        PDM score in our case).
+# v5 ≠ v6: deformable BEV OFF (flat global MHA), 2D BEV pos enc ON.
+# Everything else mirrors v6.
 #
-# Reference: arXiv:2507.18071  (Zheng et al., Qwen team)
+# Algorithm options (env-controlled):
+#   ALGORITHM=gspo        → sequence-level importance ratio (default)
+#   ALGORITHM=gspo_token  → GSPO value, per-token gradient routing
+#   ALGORITHM=grpo        → token-level (debug / baseline comparison)
 #
-# Usage:
-#   BASE_CKPT=/path/to/v6_milestone_epoch_140.ckpt ./run_gspo_training_v6.sh
-#   ALGORITHM=gspo_token ./run_gspo_training_v6.sh   # (gradient routes per-token, value matches GSPO)
+# CLIP_EPS_SEQ tuning note: paper uses 4e-4 for LLM-scale T (hundreds-thousands
+# of tokens). Our T = num_poses = 8, so per-token noise contributes ~125× more
+# to the sequence ratio. If clip_frac stays > 30% in practice, raise
+# CLIP_EPS_SEQ to ~5e-3.
 
 set -euo pipefail
 
@@ -29,15 +24,15 @@ export TMPDIR=/data2/byounggun/ray_tmp
 export PYTHONPATH="$NAVSIM_DEVKIT_ROOT:${PYTHONPATH:-}"
 
 # ── Pick a base checkpoint ────────────────────────────────────────────────
-DEFAULT_V6_DIR="/data2/byounggun/diffusiondrive_ar_output/step_corner_v2048_joint_v6/checkpoints"
+DEFAULT_V5_DIR="/data2/byounggun/diffusiondrive_ar_output/step_corner_v2048_joint_v5/checkpoints"
 if [ -z "${BASE_CKPT:-}" ]; then
-    LATEST_MS=$(ls -1 "$DEFAULT_V6_DIR"/milestone_epoch_*.ckpt 2>/dev/null | sort | tail -1)
+    LATEST_MS=$(ls -1 "$DEFAULT_V5_DIR"/milestone_epoch_*.ckpt 2>/dev/null | sort | tail -1)
     if [ -n "$LATEST_MS" ]; then
         BASE_CKPT="$LATEST_MS"
-    elif [ -f "$DEFAULT_V6_DIR/last.ckpt" ]; then
-        BASE_CKPT="$DEFAULT_V6_DIR/last.ckpt"
+    elif [ -f "$DEFAULT_V5_DIR/last.ckpt" ]; then
+        BASE_CKPT="$DEFAULT_V5_DIR/last.ckpt"
     else
-        echo "ERROR: No v6 ckpt found under $DEFAULT_V6_DIR. Set BASE_CKPT=..." >&2
+        echo "ERROR: No v5 ckpt found under $DEFAULT_V5_DIR. Set BASE_CKPT=..." >&2
         exit 1
     fi
 fi
@@ -47,32 +42,32 @@ if [ ! -f "$BASE_CKPT" ]; then
     exit 1
 fi
 
-SAFE_CKPT="/tmp/gspo_v6_base_$(date +%s).ckpt"
-ln -sfn "$BASE_CKPT" "$SAFE_CKPT"
-
 # ── Tunables (override via env) ───────────────────────────────────────────
-ALGORITHM="${ALGORITHM:-gspo}"            # gspo | gspo_token | grpo (debug)
+ALGORITHM="${ALGORITHM:-gspo}"
 GROUP_SIZE="${GROUP_SIZE:-8}"
 KL_COEF="${KL_COEF:-0.05}"
-CLIP_EPS_SEQ="${CLIP_EPS_SEQ:-4e-4}"      # GSPO sequence-level clip (paper: 3e-4 ~ 4e-4)
-CLIP_EPS="${CLIP_EPS:-0.2}"               # only used if ALGORITHM=grpo
+CLIP_EPS_SEQ="${CLIP_EPS_SEQ:-4e-4}"   # GSPO sequence-level (paper: 3e-4 ~ 4e-4)
+CLIP_EPS="${CLIP_EPS:-0.2}"            # only used if ALGORITHM=grpo
 LR="${LR:-1e-6}"
 TEMPERATURE="${TEMPERATURE:-0.3}"
 MAX_EPOCHS="${MAX_EPOCHS:-20}"
 DEVICES="${DEVICES:-4}"
-OUTPUT_DIR="${OUTPUT_DIR:-/data2/byounggun/diffusiondrive_${ALGORITHM}_output_v6}"
+OUTPUT_DIR="${OUTPUT_DIR:-/data2/byounggun/diffusiondrive_${ALGORITHM}_output_v5}"
+
+SAFE_CKPT="/tmp/${ALGORITHM}_v5_base_$(date +%s).ckpt"
+ln -sfn "$BASE_CKPT" "$SAFE_CKPT"
 
 echo "=================================================="
-echo "DiffusionDrive-AR ${ALGORITHM^^} Fine-tuning  (v6 base, sequence-level)"
+echo "DiffusionDrive-AR ${ALGORITHM^^} Fine-tuning  (v5 base, sequence-level)"
 echo "=================================================="
 echo "Algorithm    : $ALGORITHM"
 echo "Base ckpt    : $BASE_CKPT"
 echo "Hydra alias  : $SAFE_CKPT"
-echo "Group size   : $GROUP_SIZE   (rollouts per scene)"
+echo "Group size   : $GROUP_SIZE"
 echo "Temperature  : $TEMPERATURE"
 echo "KL coef      : $KL_COEF"
-echo "Clip eps_seq : $CLIP_EPS_SEQ  (GSPO; ignored if algorithm=grpo)"
-echo "Clip eps     : $CLIP_EPS      (GRPO; ignored if algorithm=gspo*)"
+echo "Clip eps_seq : $CLIP_EPS_SEQ  (sequence-level, used by gspo / gspo_token)"
+echo "Clip eps     : $CLIP_EPS  (token-level, used only if algorithm=grpo)"
 echo "LR           : $LR"
 echo "Epochs       : $MAX_EPOCHS"
 echo "Devices      : $DEVICES"
@@ -88,7 +83,7 @@ python3 -m navsim.agents.diffusiondrive.grpo_train \
     navsim_log_path="$OPENSCENE_DATA_ROOT/navsim_logs/test" \
     sensor_blobs_path="$OPENSCENE_DATA_ROOT/sensor_blobs/test" \
     output_dir="$OUTPUT_DIR" \
-    ++experiment_name="diffusiondrive_ar_${ALGORITHM}_v6" \
+    ++experiment_name="diffusiondrive_ar_${ALGORITHM}_v5" \
     ++config.ego_vocab_size=2048 \
     ++config.ego_vocab_path=/home/byounggun/DiffusionDrive/codebook_cache/navsim_kdisk_v2048_diffusiondrive/ego.npy \
     ++config.ar_codebook_mode=step_corners \
@@ -96,7 +91,7 @@ python3 -m navsim.agents.diffusiondrive.grpo_train \
     ++config.ar_use_heading_head=false \
     ++config.ar_step_aware_agent=true \
     ++config.ar_use_ego_cross_attn=true \
-    ++config.ar_use_deformable_bev=true \
+    ++config.ar_use_deformable_bev=false \
     ++config.ar_use_bev_pos_enc=true \
     ++config.agent_topk=30 \
     ++trainer.params.max_epochs="$MAX_EPOCHS" \
@@ -114,7 +109,7 @@ python3 -m navsim.agents.diffusiondrive.grpo_train \
     ++temperature="$TEMPERATURE" \
     wandb.enabled=true \
     wandb.project="diffusiondrive-grpo" \
-    wandb.name="${ALGORITHM}_v6_g${GROUP_SIZE}_t${TEMPERATURE}_kl${KL_COEF}" \
+    wandb.name="${ALGORITHM}_v5_g${GROUP_SIZE}_t${TEMPERATURE}_kl${KL_COEF}" \
     "$@"
 
 echo "=================================================="

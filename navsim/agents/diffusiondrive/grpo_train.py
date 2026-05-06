@@ -106,16 +106,46 @@ def main(cfg: DictConfig):
         token_attention_alpha=cfg.get('token_attention_alpha', 0.5),  # GRPO+ blend
     )
 
-    # Setup callbacks
+    # Setup callbacks.
+    # Goal: keep only the latest N epoch ckpts + an explicit `last.ckpt`.
+    # PL's ModelCheckpoint requires a `monitor` whenever save_top_k>0, and RL
+    # fine-tuning has no clean monotonic train signal worth picking "best" by.
+    # So we save every epoch (save_top_k=-1) and prune older files via a tiny
+    # callback that runs after each save.
+    keep_last_n = int(cfg.get('keep_last_n_ckpts', 3))
+    ckpt_dir = Path(cfg.output_dir) / "checkpoints"
+
+    class _KeepLastNCkpts(pl.callbacks.Callback):
+        """Delete all but the most recent `keep_n` epoch ckpts after each epoch.
+        Preserves `last.ckpt` (managed separately by ModelCheckpoint)."""
+
+        def __init__(self, dirpath: Path, keep_n: int):
+            self.dirpath = Path(dirpath)
+            self.keep_n = keep_n
+
+        def on_train_epoch_end(self, trainer, pl_module):
+            if not trainer.is_global_zero:
+                return
+            # Match any ModelCheckpoint output (e.g. grpo-00.ckpt or
+            # grpo-epoch=00.ckpt depending on PL version), but never touch
+            # last.ckpt — that one is owned by ModelCheckpoint.
+            ckpts = [p for p in self.dirpath.glob("grpo-*.ckpt") if p.name != "last.ckpt"]
+            ckpts.sort(key=lambda p: p.stat().st_mtime)
+            for old in ckpts[: max(0, len(ckpts) - self.keep_n)]:
+                try:
+                    old.unlink()
+                except OSError:
+                    pass
+
     callbacks = [
         pl.callbacks.ModelCheckpoint(
-            dirpath=Path(cfg.output_dir) / "checkpoints",
+            dirpath=ckpt_dir,
             filename='grpo-{epoch:02d}',
-            save_top_k=3,
-            monitor='train/mean_reward',
-            mode='max',
-            save_last=True,
+            save_top_k=-1,            # save every epoch; pruning handled below
+            every_n_epochs=1,
+            save_last=True,           # also keep an explicit `last.ckpt`
         ),
+        _KeepLastNCkpts(ckpt_dir, keep_last_n),
         pl.callbacks.LearningRateMonitor(logging_interval='step'),
     ]
 
