@@ -9,8 +9,11 @@
 #   - Model heading trusted in PDM reward (no atan2 override for step_corners)
 #   - PDM failure streak tracking (raises after PDM_FAIL_RAISE_AFTER consecutive)
 #
+# Default base = milestone_epoch_080.ckpt from joint_v6 SFT training.
+#
 # Usage:
-#   BASE_CKPT=/path/to/v6_milestone_epoch_140.ckpt ./run_grpo_training_v6.sh
+#   ./run_grpo_training_v6.sh
+#   BASE_CKPT=/path/to/v6.ckpt ./run_grpo_training_v6.sh
 #   (or override with env vars below)
 
 set -euo pipefail
@@ -23,16 +26,12 @@ export TMPDIR=/data2/byounggun/ray_tmp
 export PYTHONPATH="$NAVSIM_DEVKIT_ROOT:${PYTHONPATH:-}"
 
 # ── Pick a base checkpoint ────────────────────────────────────────────────
-# Priority: $BASE_CKPT env var > latest v6 milestone > v6 last.ckpt > error
 DEFAULT_V6_DIR="/data2/byounggun/diffusiondrive_ar_output/step_corner_v2048_joint_v6/checkpoints"
 if [ -z "${BASE_CKPT:-}" ]; then
-    LATEST_MS=$(ls -1 "$DEFAULT_V6_DIR"/milestone_epoch_*.ckpt 2>/dev/null | sort | tail -1)
-    if [ -n "$LATEST_MS" ]; then
-        BASE_CKPT="$LATEST_MS"
-    elif [ -f "$DEFAULT_V6_DIR/last.ckpt" ]; then
-        BASE_CKPT="$DEFAULT_V6_DIR/last.ckpt"
-    else
-        echo "ERROR: No v6 ckpt found under $DEFAULT_V6_DIR. Set BASE_CKPT=..." >&2
+    BASE_CKPT="$DEFAULT_V6_DIR/milestone_epoch_080.ckpt"
+    if [ ! -f "$BASE_CKPT" ]; then
+        echo "ERROR: Default v6 epoch-80 ckpt not found at: $BASE_CKPT" >&2
+        echo "       Set BASE_CKPT=/path/to/v6.ckpt to override." >&2
         exit 1
     fi
 fi
@@ -52,8 +51,9 @@ KL_COEF="${KL_COEF:-0.05}"
 CLIP_EPS="${CLIP_EPS:-0.2}"
 LR="${LR:-1e-6}"
 TEMPERATURE="${TEMPERATURE:-0.3}"
-MAX_EPOCHS="${MAX_EPOCHS:-20}"
+MAX_EPOCHS="${MAX_EPOCHS:-10}"
 DEVICES="${DEVICES:-4}"
+KEEP_LAST_N="${KEEP_LAST_N:-9999}"
 OUTPUT_DIR="${OUTPUT_DIR:-/data2/byounggun/diffusiondrive_grpo_output_v6}"
 
 echo "=================================================="
@@ -67,6 +67,7 @@ echo "KL coef      : $KL_COEF      (categorical KL on π(·|T))"
 echo "PPO clip eps : $CLIP_EPS"
 echo "LR           : $LR"
 echo "Epochs       : $MAX_EPOCHS"
+echo "Save every   : 1 epoch  (keep last $KEEP_LAST_N)"
 echo "Devices      : $DEVICES"
 echo "Output       : $OUTPUT_DIR"
 echo "=================================================="
@@ -97,11 +98,13 @@ python3 -m navsim.agents.diffusiondrive.grpo_train \
     ++trainer.params.gradient_clip_val=1.0 \
     ++batch_size=1 \
     ++num_workers=0 \
+    ++algorithm=grpo \
     ++group_size="$GROUP_SIZE" \
     ++kl_coef="$KL_COEF" \
     ++clip_eps="$CLIP_EPS" \
     ++lr="$LR" \
     ++temperature="$TEMPERATURE" \
+    ++keep_last_n_ckpts="$KEEP_LAST_N" \
     wandb.enabled=true \
     wandb.project="diffusiondrive-grpo" \
     wandb.name="grpo_v6_g${GROUP_SIZE}_t${TEMPERATURE}_kl${KL_COEF}" \

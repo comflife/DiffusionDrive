@@ -59,7 +59,7 @@ python -m navsim.planning.script.run_training \
     agent.config.ar_traj_loss_weight=8.0 \
     agent.config.ar_heading_loss_weight=2.0 \
     agent.config.ar_use_residual_delta=true \
-    agent.config.ar_use_heading_head=false \
+    agent.config.ar_use_heading_head=true \
     agent.config.ar_step_aware_agent=true \
     agent.config.ar_use_ego_cross_attn=true \
     agent.config.ar_use_deformable_bev=true \

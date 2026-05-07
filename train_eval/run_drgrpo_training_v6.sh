@@ -17,7 +17,7 @@
 #       ⇒ effective = 4 GPUs · 1 batch · 4 accum · 8 group
 #                  = 128 trajectories / opt step  (matches NoRD)
 #     1 epoch on navtest ≈ 3037 batches / 4 accum ≈ 760 opt steps
-#     save every 60 opt steps → ~12 ckpts per epoch
+#     save every epoch
 #
 # Reward stays at PDMS only — NoRD's length/format reward terms exist
 # because they output a token sequence whose length/format can be malformed;
@@ -25,9 +25,7 @@
 #
 # v6 ≠ v5: deformable BEV ON (GridSample cross-attn for K/V), bev_pos_enc ON.
 #
-# Default base = manual_epoch_068.ckpt (a copy of last-v1.ckpt at epoch 68
-# from the still-running joint_v6 SFT training, snapshotted manually so the
-# running SFT job's overwrites won't clobber it).
+# Default base = milestone_epoch_080.ckpt from joint_v6 SFT training.
 #
 # Usage:
 #   ./run_drgrpo_training_v6.sh
@@ -47,23 +45,10 @@ export PYTHONPATH="$NAVSIM_DEVKIT_ROOT:${PYTHONPATH:-}"
 # ── Pick a base checkpoint ────────────────────────────────────────────────
 DEFAULT_V6_DIR="/data2/byounggun/diffusiondrive_ar_output/step_corner_v2048_joint_v6/checkpoints"
 if [ -z "${BASE_CKPT:-}" ]; then
-    # Prefer manual_epoch_*.ckpt first (frozen snapshots), then automatic
-    # milestone_epoch_*.ckpt (only created from epoch 80 onward), then
-    # last.ckpt as last resort. NEVER pick last-v1.ckpt — that's the live
-    # file the SFT job is still overwriting.
-    #
-    # Note: `|| true` is required — `ls` exits non-zero when no glob match,
-    # which under `set -euo pipefail` would silently kill the script.
-    LATEST_MANUAL=$(ls -1 "$DEFAULT_V6_DIR"/manual_epoch_*.ckpt 2>/dev/null | sort | tail -1 || true)
-    LATEST_MS=$(ls -1 "$DEFAULT_V6_DIR"/milestone_epoch_*.ckpt 2>/dev/null | sort | tail -1 || true)
-    if [ -n "$LATEST_MANUAL" ]; then
-        BASE_CKPT="$LATEST_MANUAL"
-    elif [ -n "$LATEST_MS" ]; then
-        BASE_CKPT="$LATEST_MS"
-    elif [ -f "$DEFAULT_V6_DIR/last.ckpt" ]; then
-        BASE_CKPT="$DEFAULT_V6_DIR/last.ckpt"
-    else
-        echo "ERROR: No v6 ckpt found under $DEFAULT_V6_DIR. Set BASE_CKPT=..." >&2
+    BASE_CKPT="$DEFAULT_V6_DIR/milestone_epoch_080.ckpt"
+    if [ ! -f "$BASE_CKPT" ]; then
+        echo "ERROR: Default v6 epoch-80 ckpt not found at: $BASE_CKPT" >&2
+        echo "       Set BASE_CKPT=/path/to/v6.ckpt to override." >&2
         exit 1
     fi
 fi
@@ -82,10 +67,9 @@ KL_COEF="${KL_COEF:-0.0}"              # NoRD: no KL trust region
 CLIP_EPS="${CLIP_EPS:-0.2}"            # Dr. GRPO token-level PPO clip
 LR="${LR:-5e-6}"                       # NoRD NAVSIM constant LR
 TEMPERATURE="${TEMPERATURE:-1.0}"      # NoRD rollout temperature
-MAX_EPOCHS="${MAX_EPOCHS:-1}"          # 1 epoch ≈ ~760 opt steps @ accum=4
+MAX_EPOCHS="${MAX_EPOCHS:-10}"         # 1 epoch ≈ ~760 opt steps @ accum=4
 DEVICES="${DEVICES:-4}"
 ACCUMULATE_GRAD_BATCHES="${ACCUMULATE_GRAD_BATCHES:-4}"  # effective batch = 128 traj/step
-SAVE_EVERY_N_STEPS="${SAVE_EVERY_N_STEPS:-60}"
 KEEP_LAST_N="${KEEP_LAST_N:-9999}"     # keep all ckpts within an epoch
 OUTPUT_DIR="${OUTPUT_DIR:-/data2/byounggun/diffusiondrive_drgrpo_output_v6}"
 
@@ -107,7 +91,7 @@ echo "Devices      : $DEVICES"
 echo "Accum grads  : $ACCUMULATE_GRAD_BATCHES"
 echo "Eff. batch   : $EFFECTIVE_BATCH trajectories / opt step  (NoRD = 128)"
 echo "Epochs       : $MAX_EPOCHS"
-echo "Save every   : $SAVE_EVERY_N_STEPS opt steps  (keep last $KEEP_LAST_N)"
+echo "Save every   : 1 epoch  (keep last $KEEP_LAST_N)"
 echo "Output       : $OUTPUT_DIR"
 echo "=================================================="
 
@@ -144,7 +128,6 @@ python3 -m navsim.agents.diffusiondrive.grpo_train \
     ++clip_eps="$CLIP_EPS" \
     ++lr="$LR" \
     ++temperature="$TEMPERATURE" \
-    ++save_every_n_steps="$SAVE_EVERY_N_STEPS" \
     ++keep_last_n_ckpts="$KEEP_LAST_N" \
     wandb.enabled=true \
     wandb.project="diffusiondrive-grpo" \

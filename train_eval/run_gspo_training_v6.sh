@@ -15,8 +15,11 @@
 #
 # Reference: arXiv:2507.18071  (Zheng et al., Qwen team)
 #
+# Default base = milestone_epoch_080.ckpt from joint_v6 SFT training.
+#
 # Usage:
-#   BASE_CKPT=/path/to/v6_milestone_epoch_140.ckpt ./run_gspo_training_v6.sh
+#   ./run_gspo_training_v6.sh
+#   BASE_CKPT=/path/to/v6.ckpt ./run_gspo_training_v6.sh
 #   ALGORITHM=gspo_token ./run_gspo_training_v6.sh   # (gradient routes per-token, value matches GSPO)
 
 set -euo pipefail
@@ -31,13 +34,10 @@ export PYTHONPATH="$NAVSIM_DEVKIT_ROOT:${PYTHONPATH:-}"
 # ── Pick a base checkpoint ────────────────────────────────────────────────
 DEFAULT_V6_DIR="/data2/byounggun/diffusiondrive_ar_output/step_corner_v2048_joint_v6/checkpoints"
 if [ -z "${BASE_CKPT:-}" ]; then
-    LATEST_MS=$(ls -1 "$DEFAULT_V6_DIR"/milestone_epoch_*.ckpt 2>/dev/null | sort | tail -1)
-    if [ -n "$LATEST_MS" ]; then
-        BASE_CKPT="$LATEST_MS"
-    elif [ -f "$DEFAULT_V6_DIR/last.ckpt" ]; then
-        BASE_CKPT="$DEFAULT_V6_DIR/last.ckpt"
-    else
-        echo "ERROR: No v6 ckpt found under $DEFAULT_V6_DIR. Set BASE_CKPT=..." >&2
+    BASE_CKPT="$DEFAULT_V6_DIR/milestone_epoch_080.ckpt"
+    if [ ! -f "$BASE_CKPT" ]; then
+        echo "ERROR: Default v6 epoch-80 ckpt not found at: $BASE_CKPT" >&2
+        echo "       Set BASE_CKPT=/path/to/v6.ckpt to override." >&2
         exit 1
     fi
 fi
@@ -58,8 +58,9 @@ CLIP_EPS_SEQ="${CLIP_EPS_SEQ:-4e-4}"      # GSPO sequence-level clip (paper: 3e-
 CLIP_EPS="${CLIP_EPS:-0.2}"               # only used if ALGORITHM=grpo
 LR="${LR:-1e-6}"
 TEMPERATURE="${TEMPERATURE:-0.3}"
-MAX_EPOCHS="${MAX_EPOCHS:-20}"
+MAX_EPOCHS="${MAX_EPOCHS:-10}"
 DEVICES="${DEVICES:-4}"
+KEEP_LAST_N="${KEEP_LAST_N:-9999}"
 OUTPUT_DIR="${OUTPUT_DIR:-/data2/byounggun/diffusiondrive_${ALGORITHM}_output_v6}"
 
 echo "=================================================="
@@ -75,6 +76,7 @@ echo "Clip eps_seq : $CLIP_EPS_SEQ  (GSPO; ignored if algorithm=grpo)"
 echo "Clip eps     : $CLIP_EPS      (GRPO; ignored if algorithm=gspo*)"
 echo "LR           : $LR"
 echo "Epochs       : $MAX_EPOCHS"
+echo "Save every   : 1 epoch  (keep last $KEEP_LAST_N)"
 echo "Devices      : $DEVICES"
 echo "Output       : $OUTPUT_DIR"
 echo "=================================================="
@@ -112,6 +114,7 @@ python3 -m navsim.agents.diffusiondrive.grpo_train \
     ++clip_eps_seq="$CLIP_EPS_SEQ" \
     ++lr="$LR" \
     ++temperature="$TEMPERATURE" \
+    ++keep_last_n_ckpts="$KEEP_LAST_N" \
     wandb.enabled=true \
     wandb.project="diffusiondrive-grpo" \
     wandb.name="${ALGORITHM}_v6_g${GROUP_SIZE}_t${TEMPERATURE}_kl${KL_COEF}" \

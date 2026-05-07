@@ -33,8 +33,11 @@
 # α = 1  →  pure token-attention (no flat sequence baseline)
 # α ≈ .5 →  balanced; recommended starting point
 #
+# Default base = milestone_epoch_080.ckpt from joint_v6 SFT training.
+#
 # Usage:
-#   BASE_CKPT=/path/to/v6_milestone_epoch_140.ckpt ./run_grpo_plus_training_v6.sh
+#   ./run_grpo_plus_training_v6.sh
+#   BASE_CKPT=/path/to/v6.ckpt ./run_grpo_plus_training_v6.sh
 #   ALPHA=0.7 KL_COEF=0.05 ./run_grpo_plus_training_v6.sh
 
 set -euo pipefail
@@ -49,13 +52,10 @@ export PYTHONPATH="$NAVSIM_DEVKIT_ROOT:${PYTHONPATH:-}"
 # ── Pick a base checkpoint ────────────────────────────────────────────────
 DEFAULT_V6_DIR="/data2/byounggun/diffusiondrive_ar_output/step_corner_v2048_joint_v6/checkpoints"
 if [ -z "${BASE_CKPT:-}" ]; then
-    LATEST_MS=$(ls -1 "$DEFAULT_V6_DIR"/milestone_epoch_*.ckpt 2>/dev/null | sort | tail -1)
-    if [ -n "$LATEST_MS" ]; then
-        BASE_CKPT="$LATEST_MS"
-    elif [ -f "$DEFAULT_V6_DIR/last.ckpt" ]; then
-        BASE_CKPT="$DEFAULT_V6_DIR/last.ckpt"
-    else
-        echo "ERROR: No v6 ckpt found under $DEFAULT_V6_DIR. Set BASE_CKPT=..." >&2
+    BASE_CKPT="$DEFAULT_V6_DIR/milestone_epoch_080.ckpt"
+    if [ ! -f "$BASE_CKPT" ]; then
+        echo "ERROR: Default v6 epoch-80 ckpt not found at: $BASE_CKPT" >&2
+        echo "       Set BASE_CKPT=/path/to/v6.ckpt to override." >&2
         exit 1
     fi
 fi
@@ -75,8 +75,9 @@ KL_COEF="${KL_COEF:-0.05}"
 CLIP_EPS_SEQ="${CLIP_EPS_SEQ:-4e-4}"        # sequence-level clip (GSPO range)
 LR="${LR:-1e-6}"
 TEMPERATURE="${TEMPERATURE:-0.3}"
-MAX_EPOCHS="${MAX_EPOCHS:-20}"
+MAX_EPOCHS="${MAX_EPOCHS:-10}"
 DEVICES="${DEVICES:-4}"
+KEEP_LAST_N="${KEEP_LAST_N:-9999}"
 OUTPUT_DIR="${OUTPUT_DIR:-/data2/byounggun/diffusiondrive_grpo_plus_output_v6}"
 
 echo "=================================================="
@@ -92,6 +93,7 @@ echo "KL coef      : $KL_COEF"
 echo "Clip eps_seq : $CLIP_EPS_SEQ  (sequence-level)"
 echo "LR           : $LR"
 echo "Epochs       : $MAX_EPOCHS"
+echo "Save every   : 1 epoch  (keep last $KEEP_LAST_N)"
 echo "Devices      : $DEVICES"
 echo "Output       : $OUTPUT_DIR"
 echo "=================================================="
@@ -129,6 +131,7 @@ python3 -m navsim.agents.diffusiondrive.grpo_train \
     ++clip_eps_seq="$CLIP_EPS_SEQ" \
     ++lr="$LR" \
     ++temperature="$TEMPERATURE" \
+    ++keep_last_n_ckpts="$KEEP_LAST_N" \
     wandb.enabled=true \
     wandb.project="diffusiondrive-grpo" \
     wandb.name="grpo_plus_v6_a${ALPHA}_g${GROUP_SIZE}_t${TEMPERATURE}_kl${KL_COEF}" \
