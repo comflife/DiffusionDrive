@@ -405,8 +405,15 @@ class DiscreteARTrajectoryHead(nn.Module):
     def _build_agent_kv(self, agent_encoded: torch.Tensor, T: int) -> torch.Tensor:
         """Compose agent K/V for the AR cross-attention.
 
-        Default (additive): agent_encoded broadcast across T + step_emb + role.
-        Step-aware: nonlinear fusion of (agent, step_emb) so agent rep varies per step.
+        Default (additive, T==1): agent_encoded + role only — K/V is shared
+            across timesteps. Matches the original DiffusionDrive
+            cross_agent_attention call shape (Q=[B,T,D], K/V=[B,K,D]) so the
+            warm-started cross_agent_attention weights apply directly. Step
+            information lives on the ego query side via step_emb (no need to
+            duplicate it on the K/V side).
+        Step-aware (T==num_poses): nonlinear fusion of (agent, step_emb) so
+            agent representation varies per step. Used by `_attn_stack` in a
+            per-timestep loop when `use_step_aware_agent` is True.
         """
         B, K, D = agent_encoded.shape
         role_a = self.role_emb.weight[1].view(1, 1, 1, D)
@@ -415,8 +422,7 @@ class DiscreteARTrajectoryHead(nn.Module):
             agent_t = agent_encoded.unsqueeze(2).expand(B, K, T, D)
             agent_kv = self.step_agent_proj(torch.cat([agent_t, step_e], dim=-1))
             return agent_kv + role_a
-        step_e = self.step_emb.weight.view(1, 1, T, D)
-        return agent_encoded.unsqueeze(2).expand(-1, -1, T, -1) + step_e + role_a
+        return (agent_encoded + role_a.squeeze(2)).unsqueeze(2)  # [B, K, 1, D]
 
     @staticmethod
     def _wrap_angle(angle: torch.Tensor) -> torch.Tensor:
@@ -652,7 +658,7 @@ class DiscreteARTrajectoryHead(nn.Module):
     def _attn_stack(
         self,
         ego_q:     torch.Tensor,            # [B, M, T, D]
-        agent_kv:  torch.Tensor,            # [B, K, T, D]
+        agent_kv:  torch.Tensor,            # [B, K, T, D]  (T==1 when not step_aware_agent)
         bev_feat:  torch.Tensor,            # [B, P, D]   (flat, used when not deformable)
         topk_valid: torch.Tensor,           # [B, K]
         ego_base:  Optional[torch.Tensor] = None,           # [B, D] — for per-layer ego cross-attn
@@ -692,16 +698,32 @@ class DiscreteARTrajectoryHead(nn.Module):
                 eg2, _ = self.ego_attn[i](eg_MT, ego_kv_bm, ego_kv_bm)
                 ego_q  = self.ego_norm[i](eg_MT + eg2).reshape(B, M, T, D)
 
-            # 3. Ego-agent cross-attention (continuous agent features per timestep)
-            new_ego = []
-            for t in range(T):
-                q  = ego_q[:, :, t, :].reshape(B * M, 1, D)
-                kv = (agent_kv[:, :, t, :]
+            # 3. Ego-agent cross-attention (continuous agent features).
+            # When step_aware: per-timestep loop because K/V varies per t via
+            # the nonlinear (agent, step_emb) fusion.
+            # When NOT step_aware: single MHA call with K/V shared across T.
+            # Q=[B*M, T, D], K=V=[B*M, K, D] — exactly the call shape of the
+            # original DiffusionDrive cross_agent_attention, so the warm-started
+            # weights map onto the same Q/K/V interaction without distribution
+            # shift. AR temporal dependency is handled by the causal self-attn
+            # in step (1); this op only injects scene context.
+            if self.use_step_aware_agent:
+                new_ego = []
+                for t in range(T):
+                    q  = ego_q[:, :, t, :].reshape(B * M, 1, D)
+                    kv = (agent_kv[:, :, t, :]
+                          .unsqueeze(1).expand(-1, M, -1, -1)
+                          .reshape(B * M, K, D))
+                    out, _ = self.e2a_attn[i](q, kv, kv, key_padding_mask=inv_ag_bm)
+                    new_ego.append(self.e2a_norm[i](q + out).reshape(B, M, D))
+                ego_q = torch.stack(new_ego, dim=2)
+            else:
+                eg_MT = ego_q.reshape(B * M, T, D)
+                kv = (agent_kv[:, :, 0, :]                       # [B, K, D]
                       .unsqueeze(1).expand(-1, M, -1, -1)
                       .reshape(B * M, K, D))
-                out, _ = self.e2a_attn[i](q, kv, kv, key_padding_mask=inv_ag_bm)
-                new_ego.append(self.e2a_norm[i](q + out).reshape(B, M, D))
-            ego_q = torch.stack(new_ego, dim=2)
+                out, _ = self.e2a_attn[i](eg_MT, kv, kv, key_padding_mask=inv_ag_bm)
+                ego_q = self.e2a_norm[i](eg_MT + out).reshape(B, M, T, D)
 
             # 4. BEV cross-attention — deformable (waypoint-aware) or global flat.
             if (
