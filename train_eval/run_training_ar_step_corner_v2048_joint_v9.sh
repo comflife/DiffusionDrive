@@ -1,21 +1,24 @@
 #!/bin/bash
-# Train DiffusionDrive-AR — JOINT trunk training v7 (single-call agent attention):
-#   - based on v6 (deformable BEV + ego cross-attn + 2D BEV pos enc + agent_topk=30)
-#   - v7 change: ar_step_aware_agent -> OFF
-#   - Effect: ego-agent cross-attention is now a SINGLE MHA call per layer
-#       Q=[B*M, T, D], K=V=[B*M, K, D]   (K/V shared across T, no step_emb on K/V)
-#     instead of a T-step Python loop with per-step K/V.
-#   - This call shape is identical to the original DiffusionDrive
-#     cross_agent_attention, so the warm-started diff_decoder.cross_agent_attention
-#     weights map onto the same Q/K/V interaction with no input-distribution
-#     shift. AR temporal dependency is still enforced by the causal self-attn.
-#   - K/V no longer carries step_emb; step info lives on the ego query side via
-#     step_emb (matches v2 conditioning style).
-#   - Compute drops accordingly: agent attention is now O(layers) MHA calls
-#     per forward instead of O(layers*T).
-# Hypothesis: removing the per-timestep agent loop + dropping step_emb on the
-# agent K/V side makes the warm-started cross_agent_attention weights apply
-# more cleanly, recovering more of the 88.1 PDMS pretrain signal.
+# Train DiffusionDrive-AR — JOINT trunk training v9 (bev_first attn ordering):
+#   - based on v7 (single-call agent attention, deformable BEV ON, ego cross-attn ON,
+#     2D BEV pos enc ON, agent_topk=30, step_aware OFF)
+#   - v9 change: ar_attn_stack_ordering -> 'bev_first'
+#   - Inside each AR decoder layer the op order becomes:
+#         BEV(deform) -> Agent -> SelfAttn(causal) -> Ego(opt) -> FFN
+#     (v7 was: SelfAttn -> Ego -> Agent -> BEV -> FFN)
+#   - Rationale: original DiffusionDrive `cross_bev_attention` was trained as
+#     the FIRST op in its decoder layer — the warm-started weights expect a
+#     raw query distribution. Putting BEV first in AR puts the warm-started
+#     cross_{bev,agent} weights closer to the input distribution they were
+#     originally trained on. The causal self-attn moves to after external
+#     context, restricted to "purely temporal mixing of context-aware features".
+#   - Same warm-start map (diff_decoder.* -> AR head) as v7. Only the ORDER
+#     of the existing ops changes; no new modules added.
+#   - Backbone joint training (freeze=false), uniform LR.
+# Hypothesis: matching the original op call order on top of v7's matched call
+# shapes pushes warm-start utilization further, recovering more of the 88.1
+# PDMS pretrain signal. Risk: AR token-embedding queries are still distinct
+# from v2's learned trajectory queries, so the gain may be marginal.
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 export NAVSIM_DEVKIT_ROOT=/home/byounggun/DiffusionDrive
@@ -27,16 +30,16 @@ export PYTHONPATH="$NAVSIM_DEVKIT_ROOT:$PYTHONPATH"
 
 cd $NAVSIM_DEVKIT_ROOT
 
-echo "Starting DiffusionDrive-AR step-corner v2048 JOINT v7 (single-call agent attention)..."
+echo "Starting DiffusionDrive-AR step-corner v2048 JOINT v9 (bev_first ordering)..."
 echo "Codebook    : codebook_cache/navsim_kdisk_v2048_diffusiondrive/ego.npy  (V=2048, corner-> [V,3])"
 echo "Mode        : step_corners"
 echo "Refinement  : residual delta ON, heading head OFF"
-echo "Agent       : SINGLE-CALL (step_aware=false), K/V shared across T, no step_emb on K/V"
-echo "Conditioning: per-layer ego cross-attn ON, deformable BEV ON"
-echo "BEV path    : causal prefix trajectory-conditioned deformable sampling"
-echo "Warm-start  : diff_decoder.cross_{bev,agent,ego}_attn / ffn / norms -> AR head"
+echo "Agent       : SINGLE-CALL (step_aware=false), K/V shared across T"
+echo "Conditioning: per-layer ego cross-attn ON, deformable BEV ON, BEV pos enc ON"
+echo "Op order    : BEV -> Agent -> SelfAttn(causal) -> Ego -> FFN  (bev_first)"
+echo "Init        : warm-start from 88.1 PDMS DiffusionDrive checkpoint"
 echo "Agent K/V   : agent_topk=30 (matches original cross_agent_attention)"
-echo "LR          : uniform 2e-4 across head + trunk (no trunk lr multiplier)"
+echo "LR          : uniform 2e-4 across head + trunk"
 echo "Schedule    : 150 epochs, cosine LR matched to 150"
 echo "Snapshots   : milestone every 10 epochs starting from epoch 60"
 echo "GPUs        : $CUDA_VISIBLE_DEVICES"
@@ -46,7 +49,7 @@ python -m navsim.planning.script.run_training \
     train_test_split=navtrain \
     cache_path="/data2/byounggun/training_cache" \
     force_cache_computation=false \
-    +experiment_name=diffusiondrive_ar_step_corner_v2048_joint_v7 \
+    +experiment_name=diffusiondrive_ar_step_corner_v2048_joint_v9 \
     trainer.params.max_epochs=150 \
     +trainer.params.devices=4 \
     trainer.params.strategy=ddp_find_unused_parameters_true \
@@ -67,12 +70,13 @@ python -m navsim.planning.script.run_training \
     agent.config.ar_use_ego_cross_attn=true \
     agent.config.ar_use_deformable_bev=true \
     agent.config.ar_use_bev_pos_enc=true \
+    agent.config.ar_attn_stack_ordering=bev_first \
     agent.config.freeze_pretrained_trunk=false \
     agent.config.cos_lr_epochs=150 \
     agent.config.ckpt_milestone_start=60 \
     agent.config.ckpt_milestone_every=10 \
-    output_dir=/data2/byounggun/diffusiondrive_ar_output/step_corner_v2048_joint_v7 \
+    output_dir=/data2/byounggun/diffusiondrive_ar_output/step_corner_v2048_joint_v9 \
     wandb.enabled=true \
     wandb.project="diffusiondrive-ar" \
-    wandb.name="diffusiondrive_ar_step_corner_v2048_joint_v7" \
+    wandb.name="diffusiondrive_ar_step_corner_v2048_joint_v9" \
     "$@"

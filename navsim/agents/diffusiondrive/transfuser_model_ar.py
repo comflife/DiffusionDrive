@@ -99,6 +99,12 @@ class DiscreteARTrajectoryHead(nn.Module):
         self.use_ego_cross_attn   = getattr(config, 'ar_use_ego_cross_attn', False)
         self.use_deformable_bev   = getattr(config, 'ar_use_deformable_bev', False)
         self.use_bev_pos_enc      = getattr(config, 'ar_use_bev_pos_enc', False)
+        self.attn_stack_ordering  = getattr(config, 'ar_attn_stack_ordering', 'self_first')
+        if self.attn_stack_ordering not in ('self_first', 'bev_first'):
+            raise ValueError(
+                f"ar_attn_stack_ordering must be 'self_first' or 'bev_first', "
+                f"got {self.attn_stack_ordering!r}"
+            )
 
         # Ego vocabulary
         self.ego_vocab_size = getattr(config, 'ego_vocab_size', 512)
@@ -685,85 +691,109 @@ class DiscreteARTrajectoryHead(nn.Module):
                          .reshape(B * M, 1, D))
 
         for i in range(self.num_layers):
-            # 1. Temporal self-attention (causal)
-            eg  = ego_q.reshape(B * M, T, D)
-            eg2, _ = self.t_attn[i](eg, eg, eg, attn_mask=caus)
-            ego_q  = self.t_norm[i](eg + eg2).reshape(B, M, T, D)
-
-            # 2. (Optional) Per-layer ego cross-attention — recovers original
-            # diffusion's per-layer ego_query conditioning. Causal-safe: K/V is
-            # external scene context (length-1), not part of the AR sequence.
-            if self.use_ego_cross_attn and ego_base is not None:
-                eg_MT = ego_q.reshape(B * M, T, D)
-                eg2, _ = self.ego_attn[i](eg_MT, ego_kv_bm, ego_kv_bm)
-                ego_q  = self.ego_norm[i](eg_MT + eg2).reshape(B, M, T, D)
-
-            # 3. Ego-agent cross-attention (continuous agent features).
-            # When step_aware: per-timestep loop because K/V varies per t via
-            # the nonlinear (agent, step_emb) fusion.
-            # When NOT step_aware: single MHA call with K/V shared across T.
-            # Q=[B*M, T, D], K=V=[B*M, K, D] — exactly the call shape of the
-            # original DiffusionDrive cross_agent_attention, so the warm-started
-            # weights map onto the same Q/K/V interaction without distribution
-            # shift. AR temporal dependency is handled by the causal self-attn
-            # in step (1); this op only injects scene context.
-            if self.use_step_aware_agent:
-                new_ego = []
-                for t in range(T):
-                    q  = ego_q[:, :, t, :].reshape(B * M, 1, D)
-                    kv = (agent_kv[:, :, t, :]
-                          .unsqueeze(1).expand(-1, M, -1, -1)
-                          .reshape(B * M, K, D))
-                    out, _ = self.e2a_attn[i](q, kv, kv, key_padding_mask=inv_ag_bm)
-                    new_ego.append(self.e2a_norm[i](q + out).reshape(B, M, D))
-                ego_q = torch.stack(new_ego, dim=2)
+            if self.attn_stack_ordering == 'bev_first':
+                # v9: BEV -> Agent -> SelfAttn(causal) -> Ego(opt) -> FFN
+                # Matches original DiffusionDrive call order so warm-started
+                # cross_{bev,agent}_attention weights see input distributions
+                # closer to what they were trained on. Causal self-attn moves
+                # to AFTER external context, so its job is purely temporal
+                # mixing of already-context-aware features.
+                ego_q = self._step_bev(i, ego_q, bev_feat, bev_2d, bev_spatial_shape, ref_pts, B, M, T, D)
+                ego_q = self._step_agent(i, ego_q, agent_kv, inv_ag_bm, B, M, T, D, K)
+                ego_q = self._step_self_attn(i, ego_q, caus, B, M, T, D)
+                if self.use_ego_cross_attn and ego_base is not None:
+                    ego_q = self._step_per_layer_ego(i, ego_q, ego_kv_bm, B, M, T, D)
             else:
-                eg_MT = ego_q.reshape(B * M, T, D)
-                kv = (agent_kv[:, :, 0, :]                       # [B, K, D]
-                      .unsqueeze(1).expand(-1, M, -1, -1)
-                      .reshape(B * M, K, D))
-                out, _ = self.e2a_attn[i](eg_MT, kv, kv, key_padding_mask=inv_ag_bm)
-                ego_q = self.e2a_norm[i](eg_MT + out).reshape(B, M, T, D)
+                # 'self_first' (v6/v7/v8): SelfAttn -> Ego(opt) -> Agent -> BEV -> FFN
+                ego_q = self._step_self_attn(i, ego_q, caus, B, M, T, D)
+                if self.use_ego_cross_attn and ego_base is not None:
+                    ego_q = self._step_per_layer_ego(i, ego_q, ego_kv_bm, B, M, T, D)
+                ego_q = self._step_agent(i, ego_q, agent_kv, inv_ag_bm, B, M, T, D, K)
+                ego_q = self._step_bev(i, ego_q, bev_feat, bev_2d, bev_spatial_shape, ref_pts, B, M, T, D)
 
-            # 4. BEV cross-attention — deformable (waypoint-aware) or global flat.
-            if (
-                self.use_deformable_bev
-                and bev_2d is not None
-                and ref_pts is not None
-                and bev_spatial_shape is not None
-            ):
-                eg_MT = ego_q.reshape(B * M, T, D)
-                # Expand bev_2d to B*M batch (replicate per mode)
-                bev_2d_bm = (bev_2d.unsqueeze(1).expand(-1, M, -1, -1, -1)
-                             .reshape(B * M, *bev_2d.shape[1:]))
-                # Query t attends to the causal prefix trajectory refs ref[0..t].
-                ref_pts_bm = (
-                    ref_pts.unsqueeze(2)
-                    .expand(-1, -1, T, -1, -1)
-                    .reshape(B * M, T, T, 2)
-                )
-                ref_mask_bm = torch.tril(
-                    torch.ones(T, T, device=ref_pts.device, dtype=torch.bool)
-                ).unsqueeze(0).expand(B * M, -1, -1)
-                # GridSampleCrossBEVAttention internally does residual + dropout.
-                out = self.bev_deform_attn[i](
-                    eg_MT,
-                    ref_pts_bm,
-                    bev_2d_bm,
-                    bev_spatial_shape,
-                    point_mask=ref_mask_bm,
-                )
-                ego_q = self.bev_deform_norm[i](out).reshape(B, M, T, D)
-            else:
-                eg_MT = ego_q.reshape(B * M, T, D)
-                bev_bm = bev_feat.unsqueeze(1).expand(-1, M, -1, -1).reshape(B * M, P, D)
-                eg2, _ = self.bev_attn[i](eg_MT, bev_bm, bev_bm)
-                ego_q  = self.bev_norm[i](eg_MT + eg2).reshape(B, M, T, D)
-
-            # 5. FFN
+            # FFN (always last)
             ego_q = self.ffn_norm[i](ego_q + self.ffn[i](ego_q))
 
         return ego_q
+
+    # ------------------------------------------------------------------
+    # _attn_stack step helpers (one per attention block).
+    # Pure functions: take ego_q and return updated ego_q. No internal state
+    # mutation. The `_attn_stack` loop above orders these per
+    # `attn_stack_ordering` (currently 'self_first' or 'bev_first').
+    # ------------------------------------------------------------------
+
+    def _step_self_attn(self, i, ego_q, caus, B, M, T, D):
+        """Causal temporal self-attention. Mixes information across the AR
+        sequence. K/V is the same ego sequence (causal-masked)."""
+        eg = ego_q.reshape(B * M, T, D)
+        eg2, _ = self.t_attn[i](eg, eg, eg, attn_mask=caus)
+        return self.t_norm[i](eg + eg2).reshape(B, M, T, D)
+
+    def _step_per_layer_ego(self, i, ego_q, ego_kv_bm, B, M, T, D):
+        """Optional per-layer ego cross-attention. K/V is ego_base (length-1
+        scene context), so it's external and causal-safe regardless of order."""
+        eg_MT = ego_q.reshape(B * M, T, D)
+        eg2, _ = self.ego_attn[i](eg_MT, ego_kv_bm, ego_kv_bm)
+        return self.ego_norm[i](eg_MT + eg2).reshape(B, M, T, D)
+
+    def _step_agent(self, i, ego_q, agent_kv, inv_ag_bm, B, M, T, D, K):
+        """Ego-agent cross-attention.
+        step_aware=True : per-timestep loop because K/V varies per t.
+        step_aware=False: single MHA call (matches original cross_agent_attention
+            call shape Q=[B*M,T,D], K=V=[B*M,K,D])."""
+        if self.use_step_aware_agent:
+            new_ego = []
+            for t in range(T):
+                q  = ego_q[:, :, t, :].reshape(B * M, 1, D)
+                kv = (agent_kv[:, :, t, :]
+                      .unsqueeze(1).expand(-1, M, -1, -1)
+                      .reshape(B * M, K, D))
+                out, _ = self.e2a_attn[i](q, kv, kv, key_padding_mask=inv_ag_bm)
+                new_ego.append(self.e2a_norm[i](q + out).reshape(B, M, D))
+            return torch.stack(new_ego, dim=2)
+        eg_MT = ego_q.reshape(B * M, T, D)
+        kv = (agent_kv[:, :, 0, :]                       # [B, K, D]
+              .unsqueeze(1).expand(-1, M, -1, -1)
+              .reshape(B * M, K, D))
+        out, _ = self.e2a_attn[i](eg_MT, kv, kv, key_padding_mask=inv_ag_bm)
+        return self.e2a_norm[i](eg_MT + out).reshape(B, M, T, D)
+
+    def _step_bev(self, i, ego_q, bev_feat, bev_2d, bev_spatial_shape, ref_pts, B, M, T, D):
+        """BEV cross-attention. Deformable (waypoint-aware) when ref_pts +
+        bev_2d are provided AND use_deformable_bev is set; else flat MHA over
+        the global BEV grid."""
+        if (
+            self.use_deformable_bev
+            and bev_2d is not None
+            and ref_pts is not None
+            and bev_spatial_shape is not None
+        ):
+            eg_MT = ego_q.reshape(B * M, T, D)
+            bev_2d_bm = (bev_2d.unsqueeze(1).expand(-1, M, -1, -1, -1)
+                         .reshape(B * M, *bev_2d.shape[1:]))
+            ref_pts_bm = (
+                ref_pts.unsqueeze(2)
+                .expand(-1, -1, T, -1, -1)
+                .reshape(B * M, T, T, 2)
+            )
+            ref_mask_bm = torch.tril(
+                torch.ones(T, T, device=ref_pts.device, dtype=torch.bool)
+            ).unsqueeze(0).expand(B * M, -1, -1)
+            # GridSampleCrossBEVAttention internally does residual + dropout.
+            out = self.bev_deform_attn[i](
+                eg_MT,
+                ref_pts_bm,
+                bev_2d_bm,
+                bev_spatial_shape,
+                point_mask=ref_mask_bm,
+            )
+            return self.bev_deform_norm[i](out).reshape(B, M, T, D)
+        P = bev_feat.shape[1]
+        eg_MT = ego_q.reshape(B * M, T, D)
+        bev_bm = bev_feat.unsqueeze(1).expand(-1, M, -1, -1).reshape(B * M, P, D)
+        eg2, _ = self.bev_attn[i](eg_MT, bev_bm, bev_bm)
+        return self.bev_norm[i](eg_MT + eg2).reshape(B, M, T, D)
 
     # ------------------------------------------------------------------
     # Training / inference paths

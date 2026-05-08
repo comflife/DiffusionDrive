@@ -27,12 +27,12 @@ export PYTHONPATH="$NAVSIM_DEVKIT_ROOT:$PYTHONPATH"
 
 cd $NAVSIM_DEVKIT_ROOT
 
-echo "Starting DiffusionDrive-AR step-corner v2048 JOINT v7 (single-call agent attention)..."
+echo "Starting DiffusionDrive-AR step-corner v2048 JOINT v8 (single-call agent attention)..."
 echo "Codebook    : codebook_cache/navsim_kdisk_v2048_diffusiondrive/ego.npy  (V=2048, corner-> [V,3])"
 echo "Mode        : step_corners"
 echo "Refinement  : residual delta ON, heading head OFF"
 echo "Agent       : SINGLE-CALL (step_aware=false), K/V shared across T, no step_emb on K/V"
-echo "Conditioning: per-layer ego cross-attn ON, deformable BEV ON"
+echo "Conditioning: per-layer ego cross-attn OFF, deformable BEV OFF"
 echo "BEV path    : causal prefix trajectory-conditioned deformable sampling"
 echo "Warm-start  : diff_decoder.cross_{bev,agent,ego}_attn / ffn / norms -> AR head"
 echo "Agent K/V   : agent_topk=30 (matches original cross_agent_attention)"
@@ -46,11 +46,11 @@ python -m navsim.planning.script.run_training \
     train_test_split=navtrain \
     cache_path="/data2/byounggun/training_cache" \
     force_cache_computation=false \
-    +experiment_name=diffusiondrive_ar_step_corner_v2048_joint_v7 \
+    +experiment_name=diffusiondrive_ar_step_corner_v2048_joint_v8 \
     trainer.params.max_epochs=150 \
     +trainer.params.devices=4 \
     trainer.params.strategy=ddp_find_unused_parameters_true \
-    dataloader.params.batch_size=64 \
+    dataloader.params.batch_size=32 \
     agent.lr=2e-4 \
     agent.checkpoint_path=/home/byounggun/DiffusionDrive/diffusiondrive_navsim_88p1_PDMS \
     agent.config.ego_vocab_size=2048 \
@@ -64,15 +64,15 @@ python -m navsim.planning.script.run_training \
     agent.config.ar_use_residual_delta=true \
     agent.config.ar_use_heading_head=false \
     agent.config.ar_step_aware_agent=false \
-    agent.config.ar_use_ego_cross_attn=true \
-    agent.config.ar_use_deformable_bev=true \
-    agent.config.ar_use_bev_pos_enc=true \
+    agent.config.ar_use_ego_cross_attn=false \
+    agent.config.ar_use_deformable_bev=false \
+    agent.config.ar_use_bev_pos_enc=false \
     agent.config.freeze_pretrained_trunk=false \
     agent.config.cos_lr_epochs=150 \
     agent.config.ckpt_milestone_start=60 \
     agent.config.ckpt_milestone_every=10 \
-    output_dir=/data2/byounggun/diffusiondrive_ar_output/step_corner_v2048_joint_v7 \
+    output_dir=/data2/byounggun/diffusiondrive_ar_output/step_corner_v2048_joint_v8 \
     wandb.enabled=true \
     wandb.project="diffusiondrive-ar" \
-    wandb.name="diffusiondrive_ar_step_corner_v2048_joint_v7" \
+    wandb.name="diffusiondrive_ar_step_corner_v2048_joint_v8" \
     "$@"

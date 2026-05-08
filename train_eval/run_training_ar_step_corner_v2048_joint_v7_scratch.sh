@@ -1,21 +1,22 @@
 #!/bin/bash
-# Train DiffusionDrive-AR — JOINT trunk training v7 (single-call agent attention):
-#   - based on v6 (deformable BEV + ego cross-attn + 2D BEV pos enc + agent_topk=30)
-#   - v7 change: ar_step_aware_agent -> OFF
-#   - Effect: ego-agent cross-attention is now a SINGLE MHA call per layer
-#       Q=[B*M, T, D], K=V=[B*M, K, D]   (K/V shared across T, no step_emb on K/V)
-#     instead of a T-step Python loop with per-step K/V.
-#   - This call shape is identical to the original DiffusionDrive
-#     cross_agent_attention, so the warm-started diff_decoder.cross_agent_attention
-#     weights map onto the same Q/K/V interaction with no input-distribution
-#     shift. AR temporal dependency is still enforced by the causal self-attn.
-#   - K/V no longer carries step_emb; step info lives on the ego query side via
-#     step_emb (matches v2 conditioning style).
-#   - Compute drops accordingly: agent attention is now O(layers) MHA calls
-#     per forward instead of O(layers*T).
-# Hypothesis: removing the per-timestep agent loop + dropping step_emb on the
-# agent K/V side makes the warm-started cross_agent_attention weights apply
-# more cleanly, recovering more of the 88.1 PDMS pretrain signal.
+# Train DiffusionDrive-AR — JOINT trunk training v7_scratch (scratch init):
+#   - same architecture as v7 (single-call agent attention, deformable BEV,
+#     ego cross-attn, 2D BEV pos enc, agent_topk=30, step_aware OFF)
+#   - DIFFERENCE from v7: NO 88.1 PDMS DiffusionDrive checkpoint warm-start.
+#       agent.checkpoint_path=null  (overrides yaml default)
+#     The image/lidar backbones still load ImageNet ResNet34 (resnet34.a1_in1k)
+#     via timm's bkb_path — this matches what the original DiffusionDrive paper
+#     used as its starting point (ImageNet-pretrained backbone, head from
+#     scratch). The AR trajectory head, BEV decoders, agent/ego heads, etc.
+#     all start from random init.
+#   - Purpose: clean baseline measuring how well the AR head learns from
+#     scratch with the v7 architecture, without the (possibly imperfect)
+#     warm-start from the diffusion-trained cross-attentions.
+#   - Comparing v7 vs v7_scratch tells us how much of v7's PDMS comes from
+#     warm-start vs from architecture choices.
+# Hypothesis: v7_scratch will be lower than v7 at the same epoch count, but
+# the gap quantifies the warm-start contribution. May need more epochs to
+# converge from scratch (consider --max_epochs 200 if 150 isn't enough).
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 export NAVSIM_DEVKIT_ROOT=/home/byounggun/DiffusionDrive
@@ -27,14 +28,15 @@ export PYTHONPATH="$NAVSIM_DEVKIT_ROOT:$PYTHONPATH"
 
 cd $NAVSIM_DEVKIT_ROOT
 
-echo "Starting DiffusionDrive-AR step-corner v2048 JOINT v7 (single-call agent attention)..."
+echo "Starting DiffusionDrive-AR step-corner v2048 JOINT v7_scratch (no DiffusionDrive warm-start)..."
 echo "Codebook    : codebook_cache/navsim_kdisk_v2048_diffusiondrive/ego.npy  (V=2048, corner-> [V,3])"
 echo "Mode        : step_corners"
 echo "Refinement  : residual delta ON, heading head OFF"
 echo "Agent       : SINGLE-CALL (step_aware=false), K/V shared across T, no step_emb on K/V"
 echo "Conditioning: per-layer ego cross-attn ON, deformable BEV ON"
 echo "BEV path    : causal prefix trajectory-conditioned deformable sampling"
-echo "Warm-start  : diff_decoder.cross_{bev,agent,ego}_attn / ffn / norms -> AR head"
+echo "Init        : SCRATCH (no DiffusionDrive 88.1 PDMS checkpoint)"
+echo "Backbone    : ImageNet ResNet34 (resnet34.a1_in1k, via timm bkb_path) — same as original DiffusionDrive"
 echo "Agent K/V   : agent_topk=30 (matches original cross_agent_attention)"
 echo "LR          : uniform 2e-4 across head + trunk (no trunk lr multiplier)"
 echo "Schedule    : 150 epochs, cosine LR matched to 150"
@@ -46,13 +48,13 @@ python -m navsim.planning.script.run_training \
     train_test_split=navtrain \
     cache_path="/data2/byounggun/training_cache" \
     force_cache_computation=false \
-    +experiment_name=diffusiondrive_ar_step_corner_v2048_joint_v7 \
+    +experiment_name=diffusiondrive_ar_step_corner_v2048_joint_v7_scratch \
     trainer.params.max_epochs=150 \
     +trainer.params.devices=4 \
     trainer.params.strategy=ddp_find_unused_parameters_true \
     dataloader.params.batch_size=64 \
     agent.lr=2e-4 \
-    agent.checkpoint_path=/home/byounggun/DiffusionDrive/diffusiondrive_navsim_88p1_PDMS \
+    agent.checkpoint_path=null \
     agent.config.ego_vocab_size=2048 \
     agent.config.ego_vocab_path=/home/byounggun/DiffusionDrive/codebook_cache/navsim_kdisk_v2048_diffusiondrive/ego.npy \
     agent.config.ar_codebook_mode=step_corners \
@@ -71,8 +73,8 @@ python -m navsim.planning.script.run_training \
     agent.config.cos_lr_epochs=150 \
     agent.config.ckpt_milestone_start=60 \
     agent.config.ckpt_milestone_every=10 \
-    output_dir=/data2/byounggun/diffusiondrive_ar_output/step_corner_v2048_joint_v7 \
+    output_dir=/data2/byounggun/diffusiondrive_ar_output/step_corner_v2048_joint_v7_scratch \
     wandb.enabled=true \
     wandb.project="diffusiondrive-ar" \
-    wandb.name="diffusiondrive_ar_step_corner_v2048_joint_v7" \
+    wandb.name="diffusiondrive_ar_step_corner_v2048_joint_v7_scratch" \
     "$@"

@@ -148,6 +148,15 @@ class TransfuserConfig:
     ar_use_ego_cross_attn: bool = False  # per-layer cross-attn to ego_base (recovers original diffusion conditioning)
     ar_use_deformable_bev: bool = False  # waypoint-aware deformable BEV sampling instead of global flat attn
     ar_use_bev_pos_enc: bool = False     # 2D sin-cos positional encoding on flat BEV K/V (UniAD/DETR-style)
+    # AR _attn_stack op ordering inside each layer.
+    #   'self_first' (default, v6/v7/v8 behavior):
+    #       SelfAttn(causal) -> Ego(opt) -> Agent -> BEV -> FFN
+    #   'bev_first' (v9 experiment, matches original DiffusionDrive call order):
+    #       BEV -> Agent -> SelfAttn(causal) -> Ego(opt) -> FFN
+    # Only the order of existing ops changes; the modules/weights are identical
+    # so checkpoints can be loaded in either ordering — but training and
+    # inference must use the SAME ordering for results to be meaningful.
+    ar_attn_stack_ordering: str = 'self_first'
     # Checkpoint policy
     ckpt_save_top_k: int = 3                       # how many epoch ckpts to retain
     ckpt_monitor: Optional[str] = "val/loss"       # set None to disable monitoring (keep last N by epoch)
