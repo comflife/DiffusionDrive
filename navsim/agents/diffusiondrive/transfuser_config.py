@@ -157,6 +157,11 @@ class TransfuserConfig:
     # so checkpoints can be loaded in either ordering — but training and
     # inference must use the SAME ordering for results to be meaningful.
     ar_attn_stack_ordering: str = 'self_first'
+    # AR decoder depth (number of stacked attention layers in the AR head).
+    # Default = 2 to preserve historical behavior (v1..v9). Warm-started
+    # DiffusionDrive diff_decoder has only 2 layers, so when ar_num_layers > 2
+    # the extra AR layers stay randomly initialized (still loaded with strict=False).
+    ar_num_layers: int = 2
     # Checkpoint policy
     ckpt_save_top_k: int = 3                       # how many epoch ckpts to retain
     ckpt_monitor: Optional[str] = "val/loss"       # set None to disable monitoring (keep last N by epoch)

@@ -33,6 +33,7 @@ config:
   ar_use_deformable_bev: false
   ar_use_bev_pos_enc: false
   ar_attn_stack_ordering: self_first  # 'self_first' (v6/v7/v8) or 'bev_first' (v9)
+  ar_num_layers: 2                     # AR decoder depth (v1..v9 = 2; v10 bumps to 6/12)
   ckpt_save_top_k: 3
   ckpt_monitor: val/loss
   ckpt_milestone_start: -1

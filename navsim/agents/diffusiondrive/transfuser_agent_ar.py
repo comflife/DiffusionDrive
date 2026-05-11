@@ -324,8 +324,23 @@ class TransfuserAgentAR(AbstractAgent):
         features: Dict[str, torch.Tensor],
         targets: Dict[str, torch.Tensor] = None
     ) -> Dict[str, torch.Tensor]:
-        """Inherited, see superclass."""
-        return self._transfuser_model(features, targets=targets)
+        """Inherited, see superclass.
+
+        Pulls `temperature` from config so the AR rollout at inference uses the
+        configured sampling temperature (0.0 == greedy). Without this, the
+        compute_trajectory path silently runs greedy regardless of the config
+        value, even though GRPO's own rollout in `grpo_trainer.py` does pass
+        temperature directly.
+
+        During training Lightning calls forward with `targets` set, which
+        routes through `_forward_train` (teacher forcing) and ignores
+        temperature entirely — so passing it here is harmless for training.
+        """
+        return self._transfuser_model(
+            features,
+            targets=targets,
+            temperature=float(getattr(self._config, 'temperature', 0.0)),
+        )
         
     def compute_loss(
         self,

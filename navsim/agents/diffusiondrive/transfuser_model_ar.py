@@ -84,7 +84,7 @@ class DiscreteARTrajectoryHead(nn.Module):
         self.ego_fut_mode  = getattr(config, 'ar_num_modes', 1)
         self.agent_topk    = getattr(config, 'agent_topk', 8)
         self.score_thresh  = 0.05
-        self.num_layers    = 2
+        self.num_layers    = getattr(config, 'ar_num_layers', 2)
         self.num_heads     = 8
         self.dropout       = 0.1
         self.token_loss_weight = getattr(config, 'ar_token_loss_weight', 1.0)

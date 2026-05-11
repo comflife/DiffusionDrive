@@ -308,47 +308,59 @@ def load_navsim_trajectories(data_path, n_trajs):
 
 
 def visualize_codebook(disps, corners, output_dir, n_highlight=300):
-    """Visualize codebook tokens — displacement fan plot + heading histogram."""
+    """Visualize codebook tokens — matches navsim_kdisk_v2048_diffusiondrive/navsim_codebook_fan.png style.
+
+    Each token is drawn as a short heading segment at its (Δx, Δy) endpoint.
+    Center and heading are derived from the recomputed corners (consistent with
+    the rest of the AutoVLA pipeline).
+    """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    n_clusters = disps.shape[0]
-    dx = disps[:, 0].numpy()
-    dy = disps[:, 1].numpy()
-    dtheta = disps[:, 2].numpy()
+    n_clusters = corners.shape[0]
+
+    final_pos = corners.mean(dim=1).numpy()
+    final_x = final_pos[:, 0]
+    final_y = final_pos[:, 1]
+
+    diff_xy = (corners[:, 0] - corners[:, 3]).numpy()
+    final_h = np.arctan2(diff_xy[:, 1], diff_xy[:, 0])
+
+    seg_len = 0.3
+    dx = np.cos(final_h) * seg_len
+    dy = np.sin(final_h) * seg_len
 
     highlight_idx = np.random.choice(n_clusters, min(n_highlight, n_clusters), replace=False)
 
-    fig, axes = plt.subplots(1, 2, figsize=(16, 7))
+    x_min = min((final_x + dx).min(), final_x.min())
+    x_max = max((final_x + dx).max(), final_x.max())
+    y_min = min((final_y + dy).min(), final_y.min())
+    y_max = max((final_y + dy).max(), final_y.max())
+    x_pad = max(0.5, (x_max - x_min) * 0.05)
+    y_pad = max(0.5, (y_max - y_min) * 0.05)
 
-    # Left: fan plot (origin -> endpoint)
-    ax = axes[0]
+    fig, ax = plt.subplots(figsize=(24, 8))
+
     for i in range(n_clusters):
-        ax.plot([0, dx[i]], [0, dy[i]], color='grey', alpha=0.3, linewidth=0.5)
+        ax.plot([final_x[i], final_x[i] + dx[i]],
+                [final_y[i], final_y[i] + dy[i]],
+                'grey', alpha=0.3, linewidth=0.5)
+
     for idx in highlight_idx:
-        ax.plot([0, dx[idx]], [0, dy[idx]], 'b', alpha=0.8, linewidth=1)
-        ax.scatter([dx[idx]], [dy[idx]], s=6, c='tomato', zorder=3)
-    ax.axhline(0, color='gray', linewidth=0.5, linestyle='--')
-    ax.axvline(0, color='gray', linewidth=0.5, linestyle='--')
+        ax.plot([final_x[idx], final_x[idx] + dx[idx]],
+                [final_y[idx], final_y[idx] + dy[idx]],
+                'b', alpha=0.8, linewidth=1)
+
     ax.set_aspect('equal')
-    ax.set_xlabel('dx (m)')
-    ax.set_ylabel('dy (m)')
-    ax.set_title(f'Displacement Fan (V={n_clusters})')
+    ax.set_xlim(x_min - x_pad, x_max + x_pad)
+    ax.set_ylim(y_min - y_pad, y_max + y_pad)
+    ax.set_xlabel('Δx (m)')
+    ax.set_ylabel('Δy (m)')
+    ax.set_title(f'Action Codebook ({n_clusters} tokens)')
     ax.grid(True, alpha=0.3)
 
-    # Right: heading histogram
-    ax = axes[1]
-    ax.hist(dtheta, bins=60, color='steelblue', alpha=0.8, edgecolor='black', linewidth=0.3)
-    ax.set_xlabel('dtheta (rad)')
-    ax.set_ylabel('Count')
-    ax.set_title('Heading Change Distribution')
-    ax.grid(True, alpha=0.3)
-
-    fig.suptitle(f'AutoVLA-Methodology Codebook (V={n_clusters}, step_corners)', fontsize=13)
-    fig.tight_layout()
-
-    vis_path = output_dir / 'navsim_codebook_fan_autovla.png'
-    fig.savefig(vis_path, dpi=150, bbox_inches='tight')
+    vis_path = output_dir / 'navsim_codebook_fan.png'
+    plt.savefig(vis_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
     print(f"Saved visualization to {vis_path}")
 
@@ -361,7 +373,7 @@ def main():
     parser.add_argument("--data_path", type=str, required=True,
                         help="Path to NavSim log pkl files")
     parser.add_argument("--output", type=str,
-                        default="codebook_cache/navsim_kdisk_v2048_diffusiondrive_autovla",
+                        default="/home/byounggun/DiffusionDrive/codebook_cache/navsim_kdisk_v2048_diffusiondrive_autovla",
                         help="Output directory for codebook files")
     parser.add_argument("--vocab_size", type=int, default=2048,
                         help="Vocabulary size / number of clusters")
