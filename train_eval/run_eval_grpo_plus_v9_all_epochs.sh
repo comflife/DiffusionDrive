@@ -1,12 +1,6 @@
 #!/bin/bash
-# Evaluate DiffusionDrive-AR joint_v10 milestone checkpoints and print PDMS.
-# v10 = v9 (bev_first ordering, single-call agent, deformable BEV ON,
-#         ego cross-attn ON, BEV pos enc ON, warm-start) + ar_num_layers=6.
-#       AR head depth bumped 2 -> 12; warm-start covers only the first 2
-#       layers (DiffusionDrive diff_decoder has 2 layers); layers 2..11 are
-#       trained from random init.
-# Defaults to epoch 60, 70, ..., 150. Missing checkpoints fail the script unless
-# SKIP_MISSING=1 is set.
+# Evaluate GRPO+ (v9 base) ALL epoch checkpoints (epoch=00 .. epoch=09 + last)
+# and print PDMS summary.
 
 set -euo pipefail
 
@@ -20,12 +14,9 @@ GPUS="${GPUS:-${CUDA_VISIBLE_DEVICES:-0,1,2,3}}"
 export RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1
 export RAY_IGNORE_UNHANDLED_ERRORS=1
 
-CKPT_DIR="${CKPT_DIR:-/data2/byounggun/diffusiondrive_ar_output/step_corner_v2048_joint_v10/checkpoints}"
-EVAL_ROOT="${EVAL_ROOT:-/data2/byounggun/diffusiondrive_ar_output/eval_step_corner_v2048_joint_v10_milestones}"
+CKPT_DIR="${CKPT_DIR:-/data2/byounggun/diffusiondrive_grpo_plus_output_v9/checkpoints}"
+EVAL_ROOT="${EVAL_ROOT:-/data2/byounggun/diffusiondrive_grpo_plus_output_v9/eval_all_epochs}"
 METRIC_CACHE_PATH="${METRIC_CACHE_PATH:-/data2/byounggun/metric_cache}"
-START_EPOCH="${START_EPOCH:-60}"
-END_EPOCH="${END_EPOCH:-150}"
-EPOCH_STEP="${EPOCH_STEP:-10}"
 WORKER_THREADS="${WORKER_THREADS:-2}"
 SKIP_MISSING="${SKIP_MISSING:-0}"
 PARALLEL_EVAL="${PARALLEL_EVAL:-1}"
@@ -37,9 +28,8 @@ rm -f "$EVAL_ROOT"/summary_epoch_*.csv
 echo "epoch,checkpoint,output_dir,csv,score,valid,num_rows" > "$SUMMARY_CSV"
 
 echo "=================================================="
-echo "Evaluating DiffusionDrive-AR joint_v10 milestones (bev_first ordering, ar_num_layers=6)"
+echo "Evaluating GRPO+ v9 — ALL epochs"
 echo "Checkpoint dir : $CKPT_DIR"
-echo "Epochs         : $START_EPOCH..$END_EPOCH step $EPOCH_STEP"
 echo "GPUs           : $GPUS"
 echo "Parallel eval  : $PARALLEL_EVAL"
 echo "Metric cache   : $METRIC_CACHE_PATH"
@@ -54,16 +44,15 @@ if [ "${#GPU_LIST[@]}" -eq 0 ]; then
 fi
 
 run_eval_one() {
-    local epoch="$1"
+    local epoch_tag="$1"
     local gpu="$2"
-    printf -v epoch_tag "%03d" "$epoch"
-    local ckpt="$CKPT_DIR/milestone_epoch_${epoch_tag}.ckpt"
+    local ckpt="$CKPT_DIR/grpo-epoch=${epoch_tag}.ckpt"
     local out_dir="$EVAL_ROOT/epoch_${epoch_tag}"
-    local hydra_ckpt="/tmp/diffusiondrive_ar_step_corner_v2048_joint_v10_epoch_${epoch_tag}.ckpt"
+    local hydra_ckpt="/tmp/grpo_plus_v9_epoch_${epoch_tag}.ckpt"
     local epoch_summary="$EVAL_ROOT/summary_epoch_${epoch_tag}.csv"
 
     if [ ! -f "$ckpt" ]; then
-        echo "[epoch $epoch_tag] Missing checkpoint: $ckpt"
+        echo "[epoch ${epoch_tag}] Missing checkpoint: $ckpt"
         if [ "$SKIP_MISSING" = "1" ]; then
             return 0
         fi
@@ -73,7 +62,7 @@ run_eval_one() {
     ln -sfn "$ckpt" "$hydra_ckpt"
 
     echo "--------------------------------------------------"
-    echo "[epoch $epoch_tag] Evaluating"
+    echo "[epoch ${epoch_tag}] Evaluating"
     echo "Source ckpt : $ckpt"
     echo "Hydra alias : $hydra_ckpt"
     echo "GPU         : $gpu"
@@ -95,24 +84,23 @@ run_eval_one() {
         agent.config.ar_traj_loss_weight=8.0 \
         agent.config.ar_heading_loss_weight=2.0 \
         agent.config.ar_use_residual_delta=true \
-        agent.config.ar_use_heading_head="${HEADING_HEAD:-false}" \
+        agent.config.ar_use_heading_head=false \
         agent.config.ar_step_aware_agent=false \
         agent.config.ar_use_ego_cross_attn=true \
         agent.config.ar_use_deformable_bev=true \
         agent.config.ar_use_bev_pos_enc=true \
         agent.config.ar_attn_stack_ordering=bev_first \
-        agent.config.ar_num_layers=6 \
         agent.config.freeze_pretrained_trunk=false \
         worker=ray_distributed \
         worker.threads_per_node="$WORKER_THREADS" \
         metric_cache_path="$METRIC_CACHE_PATH" \
-        experiment_name="diffusiondrive_ar_step_corner_v2048_joint_v10_eval_epoch_${epoch_tag}" \
+        experiment_name="grpo_plus_v9_eval_epoch_${epoch_tag}" \
         output_dir="$out_dir"
 
     local latest_csv
     latest_csv="$(find "$out_dir" -maxdepth 1 -type f -name '*.csv' -printf '%T@ %p\n' | sort -n | tail -1 | cut -d' ' -f2-)"
     if [ -z "$latest_csv" ]; then
-        echo "[epoch $epoch_tag] ERROR: no PDMS csv found in $out_dir"
+        echo "[epoch ${epoch_tag}] ERROR: no PDMS csv found in $out_dir"
         return 1
     fi
 
@@ -140,19 +128,19 @@ PY
 running_jobs=0
 gpu_index=0
 
-for epoch in $(seq "$START_EPOCH" "$EPOCH_STEP" "$END_EPOCH"); do
+for epoch_tag in 00 01 02 03 04 05 06 07 08 09 last; do
     gpu="${GPU_LIST[$gpu_index]}"
     gpu_index=$(( (gpu_index + 1) % ${#GPU_LIST[@]} ))
 
     if [ "$PARALLEL_EVAL" = "1" ]; then
-        run_eval_one "$epoch" "$gpu" &
+        run_eval_one "$epoch_tag" "$gpu" &
         running_jobs=$((running_jobs + 1))
         if [ "$running_jobs" -ge "${#GPU_LIST[@]}" ]; then
             wait -n
             running_jobs=$((running_jobs - 1))
         fi
     else
-        run_eval_one "$epoch" "$gpu"
+        run_eval_one "$epoch_tag" "$gpu"
     fi
 done
 
