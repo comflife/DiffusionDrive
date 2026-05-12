@@ -94,9 +94,10 @@ class GRPOTrainer(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters()
 
-        if algorithm not in ('grpo', 'dr_grpo', 'gspo', 'gspo_token', 'grpo_plus'):
+        if algorithm not in ('grpo', 'dr_grpo', 'gspo', 'gspo_token', 'grpo_plus', 'dr_gspo', 'dr_grpo_plus'):
             raise ValueError(
-                "algorithm must be one of 'grpo', 'dr_grpo', 'gspo', 'gspo_token', 'grpo_plus'; "
+                "algorithm must be one of 'grpo', 'dr_grpo', 'gspo', 'gspo_token', "
+                "'grpo_plus', 'dr_gspo', 'dr_grpo_plus'; "
                 f"got {algorithm!r}"
             )
         if not (0.0 <= float(token_attention_alpha) <= 1.0):
@@ -602,6 +603,26 @@ class GRPOTrainer(pl.LightningModule):
             ratio_for_log = seq_ratio
             clip_eps_used = self.clip_eps_seq
 
+        elif self.algorithm == 'dr_gspo':
+            # Dr. GSPO: NoRD recipe applied to GSPO.
+            #   • No /std in advantage  (same fix as Dr. GRPO)
+            #   • Token-level PPO clip epsilon (0.2) instead of the tiny
+            #     sequence-level clip (4e-4) which is designed for LLM-scale T.
+            #     T=8 is far too short for 4e-4; it locks the ratio to ~1.0.
+            #   • Sequence-level ratio s_i = exp(mean_t Δlog π_t) kept for
+            #     consistency with GSPO formulation.
+            log_seq_ratio   = log_ratio_token.mean(dim=-1)                   # [G]
+            seq_ratio       = torch.exp(log_seq_ratio)                       # [G]
+            seq_ratio_clipd = torch.clamp(seq_ratio,
+                                          1.0 - self.clip_eps,
+                                          1.0 + self.clip_eps)
+            raw_advantages = (rewards - mean_reward).clamp(-5.0, 5.0)        # [N], no /std
+            valid_raw_adv  = raw_advantages[valid_idx]                       # [G]
+            pg_loss = -torch.min(seq_ratio       * valid_raw_adv,
+                                 seq_ratio_clipd * valid_raw_adv).mean()
+            ratio_for_log = seq_ratio
+            clip_eps_used = self.clip_eps
+
         elif self.algorithm == 'gspo_token':
             # Sequence-level importance ratio in VALUE, per-token gradient.
             #   s_{i,t} = sg[s_i] · π_θ(y_t)/sg[π_θ(y_t)]  ≡ s_i (in value)
@@ -696,6 +717,66 @@ class GRPOTrainer(pl.LightningModule):
 
             ratio_for_log = seq_ratio
             clip_eps_used = self.clip_eps_seq
+
+        elif self.algorithm == 'dr_grpo_plus':
+            # Dr. GRPO+: NoRD recipe applied to GRPO+.
+            #   • No /std in advantage  (same fix as Dr. GRPO)
+            #   • Token-level PPO clip epsilon (0.2) for both sequence and
+            #     token-attention terms. 4e-4 is far too small for T=8.
+            #   • pg_tok uses SUM over T (no length normalisation) matching
+            #     Dr. GRPO; pg_seq stays MEAN over G as it is sequence-level.
+            raw_advantages = (rewards - mean_reward).clamp(-5.0, 5.0)        # [N], no /std
+            valid_raw_adv  = raw_advantages[valid_idx]                       # [G]
+
+            # ---- (a) Sequence-level term -----------------------------------
+            log_seq_ratio   = log_ratio_token.mean(dim=-1)                   # [G]
+            seq_ratio       = torch.exp(log_seq_ratio)
+            seq_ratio_clipd = torch.clamp(seq_ratio,
+                                          1.0 - self.clip_eps,
+                                          1.0 + self.clip_eps)
+            pg_seq = -torch.min(seq_ratio       * valid_raw_adv,
+                                seq_ratio_clipd * valid_raw_adv).mean()
+
+            # ---- (b) Per-token attention weight from rollout divergence ----
+            valid_trajs = torch.stack([
+                rollouts[i].trajectory.to(self.device, dtype=torch.float32)
+                for i in valid_idx
+            ])                                                               # [G, T, 3]
+            pos_xy = valid_trajs[..., :2]                                    # [G, T, 2]
+
+            if pos_xy.shape[0] >= 2:
+                mean_xy   = pos_xy.mean(dim=0, keepdim=True)                 # [1, T, 2]
+                divergence = (pos_xy - mean_xy).norm(dim=-1)                 # [G, T]
+                norm = divergence.mean(dim=-1, keepdim=True)                 # [G, 1]
+                uniform = torch.ones_like(divergence)
+                weight  = torch.where(
+                    norm > 1e-6,
+                    divergence / norm.clamp(min=1e-6),
+                    uniform,
+                )
+                weight = weight.clamp(max=5.0)
+            else:
+                weight = torch.ones_like(new_token_log_probs)                # [G, T]
+
+            A_tok = valid_raw_adv.unsqueeze(1) * weight                      # [G, T]
+
+            # ---- (c) Token-attention term ----------------------------------
+            s_i_sg = seq_ratio.detach()                                      # [G]
+            token_grad_factor = torch.exp(
+                new_token_log_probs - new_token_log_probs.detach()
+            )                                                                # [G, T]
+            s_it       = s_i_sg.unsqueeze(1) * token_grad_factor             # [G, T]
+            s_it_clipd = torch.clamp(s_i_sg, 1.0 - self.clip_eps,
+                                     1.0 + self.clip_eps).unsqueeze(1) * token_grad_factor
+            pg_tok = -torch.min(s_it       * A_tok,
+                                s_it_clipd * A_tok).sum(dim=1).mean()        # SUM over T
+
+            # ---- (d) Blend -------------------------------------------------
+            alpha   = self.token_attention_alpha
+            pg_loss = (1.0 - alpha) * pg_seq + alpha * pg_tok
+
+            ratio_for_log = seq_ratio
+            clip_eps_used = self.clip_eps
 
         # True categorical KL on the SAMPLING-temperature distributions — more
         # stable than sampled log-prob differences and aligned with the policy
