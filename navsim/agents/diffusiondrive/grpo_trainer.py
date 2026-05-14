@@ -643,7 +643,7 @@ class GRPOTrainer(pl.LightningModule):
             ratio_for_log = s_i_sg
             clip_eps_used = self.clip_eps_seq
 
-        else:  # 'grpo_plus'
+        elif self.algorithm == 'grpo_plus':
             # GRPO+ : GSPO sequence-level importance ratio (low variance) +
             # hybrid sequence/token advantage. Designed for the trajectory-
             # reward setting (PDMS) where:
@@ -788,7 +788,7 @@ class GRPOTrainer(pl.LightningModule):
 
         # Fraction of sequences (or tokens for GRPO) that hit the clip. A non-
         # trivial fraction is expected and acceptable in GSPO per the paper.
-        if self.algorithm in ('grpo', 'dr_grpo'):
+        if self.algorithm in ('grpo', 'dr_grpo', 'dr_gspo', 'dr_grpo_plus'):
             clip_frac = ((torch.exp(log_ratio_token) - 1.0).abs() > self.clip_eps).float().mean()
         else:
             clip_frac = ((torch.exp(log_ratio_token.mean(dim=-1)) - 1.0).abs() > self.clip_eps_seq).float().mean()

@@ -1,11 +1,8 @@
 #!/bin/bash
-# Evaluate DiffusionDrive-AR joint_v11 milestone checkpoints and print PDMS.
-# v11 = step_corner v2048, bev_first ordering, single-call agent,
-#       deformable BEV ON, ego cross-attn ON, BEV pos enc ON,
-#       residual delta OFF, heading head OFF.
-#       Op order inside each AR layer:
-#         BEV(deform) -> Agent -> SelfAttn(causal) -> Ego(opt) -> FFN
-#       Same warm-start (88.1 PDMS diff_decoder.* -> AR head).
+# Evaluate DiffusionDrive-AR joint_v12 milestone checkpoints and print PDMS.
+# v12 = step_delta v1213, token-CE-only training, bev_first ordering,
+#       single-call agent, deformable BEV ON, ego cross-attn ON,
+#       BEV pos enc ON, residual delta OFF, heading head OFF.
 # Defaults to epoch 60, 70, ..., 150. Missing checkpoints fail the script unless
 # SKIP_MISSING=1 is set.
 
@@ -21,8 +18,8 @@ GPUS="${GPUS:-${CUDA_VISIBLE_DEVICES:-0,1,2,3}}"
 export RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1
 export RAY_IGNORE_UNHANDLED_ERRORS=1
 
-CKPT_DIR="${CKPT_DIR:-/data2/byounggun/diffusiondrive_ar_output/step_corner_v2048_joint_v11/checkpoints}"
-EVAL_ROOT="${EVAL_ROOT:-/data2/byounggun/diffusiondrive_ar_output/eval_step_corner_v2048_joint_v11_milestones}"
+CKPT_DIR="${CKPT_DIR:-/data2/byounggun/diffusiondrive_ar_output/step_delta_v1213_joint_v12/checkpoints}"
+EVAL_ROOT="${EVAL_ROOT:-/data2/byounggun/diffusiondrive_ar_output/eval_step_delta_v1213_joint_v12_milestones}"
 METRIC_CACHE_PATH="${METRIC_CACHE_PATH:-/data2/byounggun/metric_cache}"
 START_EPOCH="${START_EPOCH:-60}"
 END_EPOCH="${END_EPOCH:-150}"
@@ -38,7 +35,7 @@ rm -f "$EVAL_ROOT"/summary_epoch_*.csv
 echo "epoch,checkpoint,output_dir,csv,score,valid,num_rows" > "$SUMMARY_CSV"
 
 echo "=================================================="
-echo "Evaluating DiffusionDrive-AR joint_v11 milestones (bev_first ordering)"
+echo "Evaluating DiffusionDrive-AR joint_v12 milestones (step_delta, token-CE-only)"
 echo "Checkpoint dir : $CKPT_DIR"
 echo "Epochs         : $START_EPOCH..$END_EPOCH step $EPOCH_STEP"
 echo "GPUs           : $GPUS"
@@ -60,7 +57,7 @@ run_eval_one() {
     printf -v epoch_tag "%03d" "$epoch"
     local ckpt="$CKPT_DIR/milestone_epoch_${epoch_tag}.ckpt"
     local out_dir="$EVAL_ROOT/epoch_${epoch_tag}"
-    local hydra_ckpt="/tmp/diffusiondrive_ar_step_corner_v2048_joint_v11_epoch_${epoch_tag}.ckpt"
+    local hydra_ckpt="/tmp/diffusiondrive_ar_step_delta_v1213_joint_v12_epoch_${epoch_tag}.ckpt"
     local epoch_summary="$EVAL_ROOT/summary_epoch_${epoch_tag}.csv"
 
     if [ ! -f "$ckpt" ]; then
@@ -87,16 +84,16 @@ run_eval_one() {
         train_test_split=navtest \
         agent=diffusiondrive_ar_agent \
         "agent.checkpoint_path=$hydra_ckpt" \
-        agent.config.ego_vocab_size=2048 \
-        agent.config.ego_vocab_path=/home/byounggun/DiffusionDrive/codebook_cache/navsim_kdisk_v2048_diffusiondrive/ego.npy \
-        agent.config.ar_codebook_mode=step_corners \
+        agent.config.ego_vocab_size=1213 \
+        agent.config.ego_vocab_path=/home/byounggun/DiffusionDrive/codebook_cache/navsim_kdisk_v2048/ego.npy \
+        agent.config.ar_codebook_mode=step_delta \
         agent.config.ar_teacher_forcing=false \
         agent.config.ar_num_modes=1 \
         agent.config.ar_token_loss_weight=1.0 \
-        agent.config.ar_traj_loss_weight=8.0 \
-        agent.config.ar_heading_loss_weight=2.0 \
+        agent.config.ar_traj_loss_weight=0.0 \
+        agent.config.ar_heading_loss_weight=0.0 \
         agent.config.ar_use_residual_delta=false \
-        agent.config.ar_use_heading_head="${HEADING_HEAD:-false}" \
+        agent.config.ar_use_heading_head=false \
         agent.config.ar_step_aware_agent=false \
         agent.config.ar_use_ego_cross_attn=true \
         agent.config.ar_use_deformable_bev=true \
@@ -106,7 +103,7 @@ run_eval_one() {
         worker=ray_distributed \
         worker.threads_per_node="$WORKER_THREADS" \
         metric_cache_path="$METRIC_CACHE_PATH" \
-        experiment_name="diffusiondrive_ar_step_corner_v2048_joint_v11_eval_epoch_${epoch_tag}" \
+        experiment_name="diffusiondrive_ar_step_delta_v1213_joint_v12_eval_epoch_${epoch_tag}" \
         output_dir="$out_dir"
 
     local latest_csv

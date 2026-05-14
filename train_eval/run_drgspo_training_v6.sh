@@ -1,5 +1,5 @@
 #!/bin/bash
-# Dr. GRPO (arXiv:2503.20783) fine-tuning on top of the v6 SFT checkpoint,
+# Dr. GSPO (arXiv:2503.20783) fine-tuning on top of the v6 SFT checkpoint,
 # using the NoRD NAVSIM recipe (arxiv 2602.21172, §5.2 + §11.2).
 #
 # Why NoRD-style: prior recipe (lr=1e-6, KL=0.05, batch=4, T=0.7) produced
@@ -7,7 +7,7 @@
 # larger gradient steps and no KL trust region, which is what actually
 # moves a saturated SFT policy.
 #
-#   NoRD NAVSIM Dr. GRPO (their numbers):
+#   NoRD NAVSIM Dr. GSPO (their numbers):
 #     LR = 5e-6 (constant), KL = 0, temperature = 1.0,
 #     batch = 128 trajectories / opt step, group = 8, ~160 steps total
 #
@@ -58,28 +58,28 @@ if [ ! -f "$BASE_CKPT" ]; then
     exit 1
 fi
 
-SAFE_CKPT="/tmp/drgrpo_v6_base_$(date +%s).ckpt"
+SAFE_CKPT="/tmp/drgspo_v6_base_$(date +%s).ckpt"
 ln -sfn "$BASE_CKPT" "$SAFE_CKPT"
 
 # ── Tunables (NoRD recipe defaults; override via env) ─────────────────────
 GROUP_SIZE="${GROUP_SIZE:-8}"
 KL_COEF="${KL_COEF:-0.0}"              # NoRD: no KL trust region
-CLIP_EPS="${CLIP_EPS:-0.2}"            # Dr. GRPO token-level PPO clip
+CLIP_EPS="${CLIP_EPS:-0.2}"            # Dr. GSPO token-level PPO clip
 LR="${LR:-5e-6}"                       # NoRD NAVSIM constant LR
 TEMPERATURE="${TEMPERATURE:-1.0}"      # NoRD rollout temperature
 MAX_EPOCHS="${MAX_EPOCHS:-20}"         # 1 epoch ≈ ~760 opt steps @ accum=4
 DEVICES="${DEVICES:-4}"
 ACCUMULATE_GRAD_BATCHES="${ACCUMULATE_GRAD_BATCHES:-4}"  # effective batch = 128 traj/step
 KEEP_LAST_N="${KEEP_LAST_N:-9999}"     # keep all ckpts within an epoch
-OUTPUT_DIR="${OUTPUT_DIR:-/data2/byounggun/diffusiondrive_drgrpo_output_v6}"
+OUTPUT_DIR="${OUTPUT_DIR:-/data2/byounggun/diffusiondrive_dr_gspo_output_v6}"
 
 EFFECTIVE_BATCH=$(( DEVICES * ACCUMULATE_GRAD_BATCHES * GROUP_SIZE ))
 
 echo "=================================================="
-echo "DiffusionDrive-AR Dr. GRPO Fine-tuning  (v6 base, NoRD recipe)"
+echo "DiffusionDrive-AR Dr. GSPO Fine-tuning  (v6 base, NoRD recipe)"
 echo "  no std-norm, no length-norm, token-level PPO clip, no KL"
 echo "=================================================="
-echo "Algorithm    : dr_grpo"
+echo "Algorithm    : dr_gspo"
 echo "Base ckpt    : $BASE_CKPT"
 echo "Hydra alias  : $SAFE_CKPT"
 echo "Group size   : $GROUP_SIZE"
@@ -104,7 +104,7 @@ python3 -m navsim.agents.diffusiondrive.grpo_train \
     navsim_log_path="$OPENSCENE_DATA_ROOT/navsim_logs/test" \
     sensor_blobs_path="$OPENSCENE_DATA_ROOT/sensor_blobs/test" \
     output_dir="$OUTPUT_DIR" \
-    ++experiment_name=diffusiondrive_ar_drgrpo_v6 \
+    ++experiment_name=diffusiondrive_ar_drgspo_v6 \
     ++config.ego_vocab_size=2048 \
     ++config.ego_vocab_path=/home/byounggun/DiffusionDrive/codebook_cache/navsim_kdisk_v2048_diffusiondrive/ego.npy \
     ++config.ar_codebook_mode=step_corners \
@@ -122,7 +122,7 @@ python3 -m navsim.agents.diffusiondrive.grpo_train \
     ++trainer.params.accumulate_grad_batches="$ACCUMULATE_GRAD_BATCHES" \
     ++batch_size=1 \
     ++num_workers=0 \
-    ++algorithm=dr_grpo \
+    ++algorithm=dr_gspo \
     ++group_size="$GROUP_SIZE" \
     ++kl_coef="$KL_COEF" \
     ++clip_eps="$CLIP_EPS" \
@@ -131,9 +131,9 @@ python3 -m navsim.agents.diffusiondrive.grpo_train \
     ++keep_last_n_ckpts="$KEEP_LAST_N" \
     wandb.enabled=true \
     wandb.project="diffusiondrive-grpo" \
-    wandb.name="drgrpo_v6_nord_g${GROUP_SIZE}_t${TEMPERATURE}_lr${LR}_acc${ACCUMULATE_GRAD_BATCHES}" \
+    wandb.name="drgspo_v6_nord_g${GROUP_SIZE}_t${TEMPERATURE}_lr${LR}_acc${ACCUMULATE_GRAD_BATCHES}" \
     "$@"
 
 echo "=================================================="
-echo "Dr. GRPO Training Complete (v6)! Output: $OUTPUT_DIR"
+echo "Dr. GSPO Training Complete (v6)! Output: $OUTPUT_DIR"
 echo "=================================================="
