@@ -88,6 +88,7 @@ class GRPOTrainer(pl.LightningModule):
         algorithm: str = 'grpo',     # 'grpo' | 'dr_grpo' | 'gspo' | 'gspo_token' | 'grpo_plus'
         clip_eps_seq: float = 4e-4,  # sequence-level clipping eps for GSPO / GRPO+
         token_attention_alpha: float = 0.5,  # GRPO+: blend (1-α)·GSPO + α·token-attn
+        sft_aux_coef: float = 0.0,   # ver3: auxiliary SFT CE loss on expert tokens (prevents forgetting)
         max_grad_norm: float = 1.0,
         **kwargs,
     ):
@@ -113,6 +114,7 @@ class GRPOTrainer(pl.LightningModule):
         self.algorithm = algorithm
         self.clip_eps_seq = clip_eps_seq
         self.token_attention_alpha = float(token_attention_alpha)
+        self.sft_aux_coef = float(sft_aux_coef)
         self.max_grad_norm = max_grad_norm
 
         # Policy model (trainable)
@@ -162,6 +164,64 @@ class GRPOTrainer(pl.LightningModule):
     ) -> torch.Tensor:
         """Index log_probs_all by tokens to get [..., T] log probs."""
         return torch.gather(log_probs_all, dim=-1, index=tokens.unsqueeze(-1)).squeeze(-1)
+
+    def _compute_sft_aux_loss(self, features: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """Compute small auxiliary CE loss on expert (ground-truth) tokens.
+
+        This is the key 'smart anchor' for ver3 ultra-aggressive RL:
+        it prevents the policy from forgetting the strong SFT behavior while
+        still allowing large policy updates from GRPO/GSPO signals.
+        """
+        if self.sft_aux_coef <= 0:
+            return torch.zeros((), device=self.device)
+
+        gt_traj = targets.get("trajectory")
+        if gt_traj is None:
+            return torch.zeros((), device=self.device)
+
+        # Normalize shape to [B, M, T, 3] expected by match_to_step_corner_codebook
+        # GRPO uses batch_size=1, and current v6_waymo uses M=1 (single mode)
+        if gt_traj.dim() == 2:          # [T, 3]
+            gt_traj = gt_traj.unsqueeze(0).unsqueeze(0)   # [1, 1, T, 3]
+        elif gt_traj.dim() == 3:        # [B, T, 3] or [1, T, 3]
+            gt_traj = gt_traj.unsqueeze(1)                # [B, 1, T, 3]
+
+        device = self.device
+        gt_traj = gt_traj.to(device)
+
+        try:
+            head = getattr(self.policy_model, '_trajectory_head', None)
+            if head is None or not hasattr(head, 'match_to_step_corner_codebook'):
+                return torch.zeros((), device=device)
+
+            codebook = getattr(head, 'ego_codebook', None)
+            if codebook is None:
+                return torch.zeros((), device=device)
+
+            expert_tokens = head.match_to_step_corner_codebook(
+                gt_traj, codebook.to(device)
+            )  # [B, M, T]
+            expert_tokens = expert_tokens.squeeze(1).squeeze(0)   # [T] for B=1,M=1
+
+            if expert_tokens.numel() == 0:
+                return torch.zeros((), device=device)
+
+            # Teacher-force the expert tokens through the policy
+            with self._temporary_eval_mode(self.policy_model):
+                _, logits = self.policy_model.compute_token_log_probs(
+                    {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in features.items()},
+                    expert_tokens.unsqueeze(0)   # [1, T]
+                )  # logits: [1, T, V]
+
+            # Standard CE loss (negative log likelihood of expert tokens)
+            log_probs = F.log_softmax(logits / self._safe_temperature(1.0), dim=-1)
+            ce_loss = -self._gather_token_log_probs(log_probs, expert_tokens.unsqueeze(0)).mean()
+
+            return ce_loss
+        except Exception as e:
+            # Defensive: if anything goes wrong (shape mismatch etc.), skip aux loss
+            print(f"[GRPO ver3] SFT aux loss skipped due to: {e}")
+            return torch.zeros((), device=device)
 
     # ------------------------------------------------------------------
     # Utility helpers
@@ -723,8 +783,8 @@ class GRPOTrainer(pl.LightningModule):
             #   • No /std in advantage  (same fix as Dr. GRPO)
             #   • Token-level PPO clip epsilon (0.2) for both sequence and
             #     token-attention terms. 4e-4 is far too small for T=8.
-            #   • pg_tok uses SUM over T (no length normalisation) matching
-            #     Dr. GRPO; pg_seq stays MEAN over G as it is sequence-level.
+            #   • pg_tok uses MEAN over T (scale-aligned with pg_seq)
+            #   • Reward-weighted centroid + temporal decay for token weights
             raw_advantages = (rewards - mean_reward).clamp(-5.0, 5.0)        # [N], no /std
             valid_raw_adv  = raw_advantages[valid_idx]                       # [G]
 
@@ -737,7 +797,7 @@ class GRPOTrainer(pl.LightningModule):
             pg_seq = -torch.min(seq_ratio       * valid_raw_adv,
                                 seq_ratio_clipd * valid_raw_adv).mean()
 
-            # ---- (b) Per-token attention weight from rollout divergence ----
+            # ---- (b) Per-token attention weight (REWARD-AWARE + TEMPORAL) --
             valid_trajs = torch.stack([
                 rollouts[i].trajectory.to(self.device, dtype=torch.float32)
                 for i in valid_idx
@@ -745,22 +805,42 @@ class GRPOTrainer(pl.LightningModule):
             pos_xy = valid_trajs[..., :2]                                    # [G, T, 2]
 
             if pos_xy.shape[0] >= 2:
-                mean_xy   = pos_xy.mean(dim=0, keepdim=True)                 # [1, T, 2]
+                # Reward-weighted centroid (not simple mean)
+                # Stability via temperature-scaled softmax
+                reward_weights = F.softmax(valid_raw_adv / 0.5, dim=0)       # [G]
+                mean_xy = (pos_xy * reward_weights.view(-1, 1, 1)).sum(
+                    dim=0, keepdim=True
+                )                                                            # [1, T, 2]
+
                 divergence = (pos_xy - mean_xy).norm(dim=-1)                 # [G, T]
+
+                # Per-rollout normalize (mean over t = 1)
                 norm = divergence.mean(dim=-1, keepdim=True)                 # [G, 1]
                 uniform = torch.ones_like(divergence)
-                weight  = torch.where(
+                weight = torch.where(
                     norm > 1e-6,
                     divergence / norm.clamp(min=1e-6),
                     uniform,
                 )
+
+                # Temporal decay: early tokens have more causal influence
+                T_len = weight.shape[-1]
+                temporal_decay = torch.linspace(
+                    1.0, 0.3, T_len, device=weight.device
+                )                                                            # [T]
+                weight = weight * temporal_decay.unsqueeze(0)                # [G, T]
+                # Re-normalize so mean over t ≈ 1
+                weight = weight / weight.mean(
+                    dim=-1, keepdim=True
+                ).clamp(min=1e-6)
+
                 weight = weight.clamp(max=5.0)
             else:
                 weight = torch.ones_like(new_token_log_probs)                # [G, T]
 
             A_tok = valid_raw_adv.unsqueeze(1) * weight                      # [G, T]
 
-            # ---- (c) Token-attention term ----------------------------------
+            # ---- (c) Token-attention term (MEAN over T for scale alignment) -
             s_i_sg = seq_ratio.detach()                                      # [G]
             token_grad_factor = torch.exp(
                 new_token_log_probs - new_token_log_probs.detach()
@@ -768,11 +848,22 @@ class GRPOTrainer(pl.LightningModule):
             s_it       = s_i_sg.unsqueeze(1) * token_grad_factor             # [G, T]
             s_it_clipd = torch.clamp(s_i_sg, 1.0 - self.clip_eps,
                                      1.0 + self.clip_eps).unsqueeze(1) * token_grad_factor
+            # FIX: mean(dim=1) so pg_tok and pg_seq are on comparable scales
             pg_tok = -torch.min(s_it       * A_tok,
-                                s_it_clipd * A_tok).sum(dim=1).mean()        # SUM over T
+                                s_it_clipd * A_tok).mean(dim=1).mean()
 
-            # ---- (d) Blend -------------------------------------------------
-            alpha   = self.token_attention_alpha
+            # ---- (d) Adaptive alpha ----------------------------------------
+            current_epoch = getattr(
+                getattr(self, 'trainer', None), 'current_epoch', 0
+            ) if hasattr(self, 'trainer') else 0
+            max_epochs = getattr(
+                getattr(self, 'trainer', None), 'max_epochs', 20
+            ) if hasattr(self, 'trainer') else 20
+            # Linear ramp from 0.3 to 0.7 over 80% of training
+            alpha = 0.3 + 0.4 * min(
+                1.0, current_epoch / max(1.0, max_epochs * 0.8)
+            )
+
             pg_loss = (1.0 - alpha) * pg_seq + alpha * pg_tok
 
             ratio_for_log = seq_ratio
@@ -847,6 +938,13 @@ class GRPOTrainer(pl.LightningModule):
 
         # Loss phase (with grad) — teacher-forced log probs
         loss, metrics = self.compute_grpo_loss(rollouts, features)
+
+        # ver3 ultra-aggressive: small SFT auxiliary loss as smart anchor
+        if self.sft_aux_coef > 0:
+            sft_aux = self._compute_sft_aux_loss(features, targets)
+            loss = loss + self.sft_aux_coef * sft_aux
+            metrics['sft_aux_loss'] = sft_aux.item()
+            metrics['total_loss_with_aux'] = loss.item()
 
         for key, value in metrics.items():
             self.log(f'train/{key}', value, on_step=True, prog_bar=True)

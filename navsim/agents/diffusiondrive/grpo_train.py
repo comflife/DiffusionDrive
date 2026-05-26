@@ -104,6 +104,7 @@ def main(cfg: DictConfig):
         algorithm=cfg.get('algorithm', 'grpo'),                  # 'grpo' | 'dr_grpo' | 'gspo' | 'gspo_token' | 'grpo_plus'
         clip_eps_seq=cfg.get('clip_eps_seq', 4e-4),              # GSPO / GRPO+ sequence-level clip
         token_attention_alpha=cfg.get('token_attention_alpha', 0.5),  # GRPO+ blend
+        sft_aux_coef=cfg.get('sft_aux_coef', 0.0),                    # ver3 SFT auxiliary loss weight
     )
 
     # Setup callbacks.
@@ -208,8 +209,17 @@ def main(cfg: DictConfig):
         log_every_n_steps=10,
     )
 
-    # Train
-    trainer.fit(model, datamodule=datamodule)
+    # Train. `checkpoint_path` above is the pretrained/SFT warm start. This
+    # optional path is a Lightning training checkpoint for true resume
+    # semantics: epoch, global step, optimizer, schedulers, and callbacks.
+    resume_ckpt_path = cfg.get('resume_ckpt_path', None)
+    if resume_ckpt_path:
+        resume_ckpt_path = str(resume_ckpt_path)
+        if not Path(resume_ckpt_path).is_file():
+            raise FileNotFoundError(f"resume_ckpt_path not found: {resume_ckpt_path}")
+        print(f"[grpo_train] Resuming Lightning training state from: {resume_ckpt_path}")
+
+    trainer.fit(model, datamodule=datamodule, ckpt_path=resume_ckpt_path)
 
     print(f"Training complete! Checkpoints saved to: {cfg.output_dir}/checkpoints")
 
