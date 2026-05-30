@@ -49,9 +49,11 @@ def filter_scenes(data_path: Path, scene_filter: SceneFilter) -> Dict[str, List[
             if scene_filter.has_route and len(frame_list[scene_filter.num_history_frames - 1]["roadblock_ids"]) == 0:
                 continue
 
-            # Filter by token
+            # Filter by token. Assignment exports use scene_token, while
+            # metric caches and SceneLoader keys use the current-frame token.
             token = frame_list[scene_filter.num_history_frames - 1]["token"]
-            if filter_tokens and token not in tokens:
+            scene_token = frame_list[scene_filter.num_history_frames - 1].get("scene_token")
+            if filter_tokens and token not in tokens and scene_token not in tokens:
                 continue
 
             filtered_scenes[token] = frame_list
