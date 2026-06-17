@@ -1,0 +1,33 @@
+{
+  "selection_rule": "current-code base rescore <=0.7, all three RL ver2 CSV scores >=0.95; manually diversified across DAC and collision/TTC failures",
+  "eval_split": "navtest (same 12146-token validation/test split used by existing eval scripts)",
+  "models": {
+    "base_v6_waymo_ep120": "/data2/byounggun/diffusiondrive_ar_output/eval_step_corner_v2048_joint_v6_waymo_milestones/epoch_120/2026.05.15.14.32.54.csv",
+    "drgrpo_plus_ver2_ep26": "/data2/byounggun/diffusiondrive_drgrpo_plus_output_v6_waymo_epoch120_ver2/eval_epoch_26/2026.05.26.20.03.06.csv",
+    "drgrpo_ver2_ep26": "/data2/byounggun/diffusiondrive_drgrpo_output_v6_waymo_epoch120_ver2/eval_epoch_26/2026.05.26.20.03.29.csv",
+    "drgspo_ver2_ep26": "/data2/byounggun/diffusiondrive_dr_gspo_output_v6_waymo_epoch120_ver2/eval_epoch_26/2026.05.26.20.01.50.csv"
+  },
+  "selected_tokens": [
+    "7766bcc52078528c",
+    "d87ac612c49152b5",
+    "c35e290a671a5084",
+    "9aad3780bef85c98",
+    "277f191c94b952f3"
+  ],
+  "metrics": {
+    "no_at_fault_collisions": "NC",
+    "drivable_area_compliance": "DAC",
+    "ego_progress": "EP",
+    "time_to_collision_within_bound": "TTC",
+    "comfort": "C",
+    "driving_direction_compliance": "DDC",
+    "score": "PDMS"
+  },
+  "files": {
+    "selected_wide": "/home/byounggun/DiffusionDrive/plots/waymo_rl_ver2_base_bad_scene_sets/selected_5_scene_sets_wide.csv",
+    "selected_long": "/home/byounggun/DiffusionDrive/plots/waymo_rl_ver2_base_bad_scene_sets/selected_5_scene_sets_long.csv",
+    "top50_pool": "/home/byounggun/DiffusionDrive/plots/waymo_rl_ver2_base_bad_scene_sets/top50_base_bad_rl_good_candidates.csv",
+    "tokens": "/home/byounggun/DiffusionDrive/plots/waymo_rl_ver2_base_bad_scene_sets/selected_tokens.txt"
+  },
+  "base_scores_source": "/home/byounggun/DiffusionDrive/plots/waymo_rl_ver2_base_bad_scene_sets/top50_current_base_rescore.csv"
+}

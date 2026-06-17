@@ -935,6 +935,7 @@ class GRPOTrainer(pl.LightningModule):
 
         # Rollout phase (no grad) — stores old log_probs
         rollouts = self.sample_rollouts(features, metric_cache, self.group_size)
+        self.policy_model.train()  # BUGFIX: sample_rollouts leaves model in eval mode
 
         # Loss phase (with grad) — teacher-forced log probs
         loss, metrics = self.compute_grpo_loss(rollouts, features)

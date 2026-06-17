@@ -1,0 +1,38 @@
+{
+  "artifact_dir": "/home/byounggun/DiffusionDrive/plots/waymo_rl_ver2_base_bad_scene_sets/current_selection_artifacts",
+  "token_file": "/home/byounggun/DiffusionDrive/plots/waymo_rl_ver2_base_bad_scene_sets/selected_tokens.txt",
+  "fps": 2.0,
+  "videos": [
+    {
+      "token": "7766bcc52078528c",
+      "gif": "/home/byounggun/DiffusionDrive/plots/waymo_rl_ver2_base_bad_scene_sets/current_selection_artifacts/closed_loop_videos/00_7766bcc52078528c_closed_loop.gif",
+      "npz": "/home/byounggun/DiffusionDrive/plots/waymo_rl_ver2_base_bad_scene_sets/current_selection_artifacts/trajectories/00_7766bcc52078528c.npz",
+      "mp4": "/home/byounggun/DiffusionDrive/plots/waymo_rl_ver2_base_bad_scene_sets/current_selection_artifacts/closed_loop_videos/00_7766bcc52078528c_closed_loop.mp4"
+    },
+    {
+      "token": "d87ac612c49152b5",
+      "gif": "/home/byounggun/DiffusionDrive/plots/waymo_rl_ver2_base_bad_scene_sets/current_selection_artifacts/closed_loop_videos/01_d87ac612c49152b5_closed_loop.gif",
+      "npz": "/home/byounggun/DiffusionDrive/plots/waymo_rl_ver2_base_bad_scene_sets/current_selection_artifacts/trajectories/01_d87ac612c49152b5.npz",
+      "mp4": "/home/byounggun/DiffusionDrive/plots/waymo_rl_ver2_base_bad_scene_sets/current_selection_artifacts/closed_loop_videos/01_d87ac612c49152b5_closed_loop.mp4"
+    },
+    {
+      "token": "c35e290a671a5084",
+      "gif": "/home/byounggun/DiffusionDrive/plots/waymo_rl_ver2_base_bad_scene_sets/current_selection_artifacts/closed_loop_videos/02_c35e290a671a5084_closed_loop.gif",
+      "npz": "/home/byounggun/DiffusionDrive/plots/waymo_rl_ver2_base_bad_scene_sets/current_selection_artifacts/trajectories/02_c35e290a671a5084.npz",
+      "mp4": "/home/byounggun/DiffusionDrive/plots/waymo_rl_ver2_base_bad_scene_sets/current_selection_artifacts/closed_loop_videos/02_c35e290a671a5084_closed_loop.mp4"
+    },
+    {
+      "token": "9aad3780bef85c98",
+      "gif": "/home/byounggun/DiffusionDrive/plots/waymo_rl_ver2_base_bad_scene_sets/current_selection_artifacts/closed_loop_videos/03_9aad3780bef85c98_closed_loop.gif",
+      "npz": "/home/byounggun/DiffusionDrive/plots/waymo_rl_ver2_base_bad_scene_sets/current_selection_artifacts/trajectories/03_9aad3780bef85c98.npz",
+      "mp4": "/home/byounggun/DiffusionDrive/plots/waymo_rl_ver2_base_bad_scene_sets/current_selection_artifacts/closed_loop_videos/03_9aad3780bef85c98_closed_loop.mp4"
+    },
+    {
+      "token": "277f191c94b952f3",
+      "gif": "/home/byounggun/DiffusionDrive/plots/waymo_rl_ver2_base_bad_scene_sets/current_selection_artifacts/closed_loop_videos/04_277f191c94b952f3_closed_loop.gif",
+      "npz": "/home/byounggun/DiffusionDrive/plots/waymo_rl_ver2_base_bad_scene_sets/current_selection_artifacts/trajectories/04_277f191c94b952f3.npz",
+      "mp4": "/home/byounggun/DiffusionDrive/plots/waymo_rl_ver2_base_bad_scene_sets/current_selection_artifacts/closed_loop_videos/04_277f191c94b952f3_closed_loop.mp4"
+    }
+  ],
+  "note": "Rollouts are PDM-simulated trajectories from saved model plans, not just raw predicted paths."
+}

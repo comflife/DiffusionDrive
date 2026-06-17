@@ -25,12 +25,18 @@ build/
 # Data
 codebook_cache/
 *.npy
+*.npz
+*.csv
+*.txt
 !kmeans_navsim_traj_20.npy
+!requirements.txt
 
 # Logs
 diffusiondrive_navsim_88p1_PDMS
 *.log
 
-# Images
+# Images & media
 *.png
+*.gif
+*.mp4
 

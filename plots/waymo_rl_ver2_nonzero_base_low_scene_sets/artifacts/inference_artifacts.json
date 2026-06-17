@@ -1,0 +1,39 @@
+{
+  "tokens": [
+    "38b3c670b2ad55c7",
+    "534efc35151f543d",
+    "14b839d065b358d0",
+    "ddc25b8617cb5aa0",
+    "b27bb0eced055858"
+  ],
+  "models": {
+    "human": {
+      "color": "#2ca02c",
+      "linestyle": "-",
+      "ckpt": null
+    },
+    "base_v6_waymo_ep120": {
+      "color": "#555555",
+      "linestyle": "--",
+      "ckpt": "/data2/byounggun/diffusiondrive_ar_output/step_corner_v2048_joint_v6_waymo/checkpoints/milestone_epoch_120.ckpt"
+    },
+    "drgrpo_plus_ver2_ep26": {
+      "color": "#d62728",
+      "linestyle": "-",
+      "ckpt": "/data2/byounggun/diffusiondrive_drgrpo_plus_output_v6_waymo_epoch120_ver2/checkpoints/grpo-epoch=26.ckpt"
+    },
+    "drgrpo_ver2_ep26": {
+      "color": "#1f77b4",
+      "linestyle": "-",
+      "ckpt": "/data2/byounggun/diffusiondrive_drgrpo_output_v6_waymo_epoch120_ver2/checkpoints/grpo-epoch=26.ckpt"
+    },
+    "drgspo_ver2_ep26": {
+      "color": "#ff7f0e",
+      "linestyle": "-",
+      "ckpt": "/data2/byounggun/diffusiondrive_dr_gspo_output_v6_waymo_epoch120_ver2/checkpoints/grpo-epoch=26.ckpt"
+    }
+  },
+  "trajectories_dir": "/home/byounggun/DiffusionDrive/plots/waymo_rl_ver2_nonzero_base_low_scene_sets/artifacts/trajectories",
+  "bev_overlay_dir": "/home/byounggun/DiffusionDrive/plots/waymo_rl_ver2_nonzero_base_low_scene_sets/artifacts/bev_overlay",
+  "recomputed_metrics": "/home/byounggun/DiffusionDrive/plots/waymo_rl_ver2_nonzero_base_low_scene_sets/artifacts/recomputed_inference_metrics.csv"
+}

@@ -727,6 +727,9 @@ class DiscreteARTrajectoryHead(nn.Module):
         """Causal temporal self-attention. Mixes information across the AR
         sequence. K/V is the same ego sequence (causal-masked)."""
         eg = ego_q.reshape(B * M, T, D)
+        # Convert bool causal mask to float additive mask to avoid PyTorch warning
+        if caus.dtype == torch.bool:
+            caus = caus.float().masked_fill(caus, float('-inf'))
         eg2, _ = self.t_attn[i](eg, eg, eg, attn_mask=caus)
         return self.t_norm[i](eg + eg2).reshape(B, M, T, D)
 

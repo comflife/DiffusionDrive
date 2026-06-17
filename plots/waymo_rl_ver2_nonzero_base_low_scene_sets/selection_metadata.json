@@ -1,0 +1,12 @@
+{
+  "selection_rule": "current-code base score > 0 and <= 0.75, all three RL ver2 CSV scores >= 0.9; top 5 by rl_min - current_base",
+  "tokens": [
+    "38b3c670b2ad55c7",
+    "534efc35151f543d",
+    "14b839d065b358d0",
+    "ddc25b8617cb5aa0",
+    "b27bb0eced055858"
+  ],
+  "source_candidates": "/home/byounggun/DiffusionDrive/plots/waymo_rl_ver2_nonzero_base_low_scene_sets/nonzero_base_low_current_candidates.csv",
+  "base_rescore": "/home/byounggun/DiffusionDrive/plots/waymo_rl_ver2_nonzero_base_low_scene_sets/candidate30_current_base_rescore.csv"
+}
