@@ -1,0 +1,22 @@
+hydra:
+  run:
+    dir: ${cache.cache_path}/hydra
+  output_subdir: ${cache.cache_path}/hydra/code
+  searchpath:
+    - pkg://navsim.planning.script.config.common
+  job:
+    chdir: False
+
+defaults:
+  - default_common
+  - _self_
+  - override train_test_split: navtrain
+
+navsim_log_path: /data/navsim/dataset/navsim_logs/trainval
+sensor_blobs_path: /data/navsim/dataset/sensor_blobs/trainval
+metric_cache_path: /data2/byounggun/metric_cache_train
+output_dir: ${cache.cache_path}
+
+cache:
+  cache_path: /data2/byounggun/metric_cache_train
+  force_feature_computation: false

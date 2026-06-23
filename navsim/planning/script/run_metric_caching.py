@@ -1,35 +1,32 @@
 import logging
+from pathlib import Path
+
 import hydra
 from omegaconf import DictConfig
-
-from nuplan.planning.script.builders.logging_builder import build_logger
 
 from navsim.planning.metric_caching.caching import cache_data
 from navsim.planning.script.builders.worker_pool_builder import build_worker
 
 logger = logging.getLogger(__name__)
 
-CONFIG_PATH = "config/metric_caching"
-CONFIG_NAME = "default_metric_caching"
+CONFIG_PATH = "config/pdm_scoring"
+CONFIG_NAME = "default_run_metric_caching"
 
 
 @hydra.main(config_path=CONFIG_PATH, config_name=CONFIG_NAME, version_base=None)
 def main(cfg: DictConfig) -> None:
     """
-    Main entrypoint for metric caching.
+    Build metric caches for NAVSIM scenes.
     :param cfg: omegaconf dictionary
     """
-    # Configure logger
-    build_logger(cfg)
+    cache_path = Path(cfg.cache.cache_path)
+    cache_path.mkdir(parents=True, exist_ok=True)
 
-    # Build worker
+    logger.info(f"Metric cache path: {cache_path}")
+    logger.info(f"Navsim log path: {cfg.navsim_log_path}")
+
     worker = build_worker(cfg)
-
-    # Precompute and cache all features
-    logger.info("Starting Metric Caching...")
-    if cfg.worker == "ray_distributed" and cfg.worker.use_distributed:
-        raise AssertionError("ray in distributed mode will not work with this job")
-    cache_data(cfg=cfg, worker=worker)
+    cache_data(cfg, worker)
 
 
 if __name__ == "__main__":

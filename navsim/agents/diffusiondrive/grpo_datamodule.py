@@ -160,12 +160,18 @@ class GRPODataModule(pl.LightningDataModule):
         # Metric cache loader
         metric_cache_loader = MetricCacheLoader(Path(self.hparams.metric_cache_path))
         
+        # Pass scene_filter.tokens so the dataset filters to the requested scenes
+        tokens = self.train_test_split.get('scene_filter', {}).get('tokens', None)
+        if tokens is not None:
+            tokens = list(tokens)
+        
         # Create dataset
         self.dataset = GRPOEpisodeDataset(
             scene_loader=scene_loader,
             metric_cache_loader=metric_cache_loader,
             feature_builders=feature_builders,
             target_builders=target_builders,
+            tokens=tokens,
         )
         
     def train_dataloader(self):
