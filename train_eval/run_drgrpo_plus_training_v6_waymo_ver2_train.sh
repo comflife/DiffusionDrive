@@ -1,8 +1,10 @@
 #!/bin/bash
-# Dr. GRPO+ v2 (Aggressive) fine-tuning on v6_waymo epoch-120 SFT, full VAL split.
+# Dr. GRPO+ v2 (Aggressive) fine-tuning on v6_waymo epoch-120 SFT, full navtrain.
 #
-# Uses all navtrain val-log scenes (~2.6k). Assignment/random wrappers override
-# tokens to smaller subsets from the same metric cache.
+# Uses the FULL navtrain scene_filter (103,288 anchor tokens). The datamodule
+# intersects requested scenes with the metric cache, so the effective trainable
+# set = navtrain ∩ cache (~10k with the merged val+navtrain cache).
+# Assignment/random wrappers override tokens to smaller subsets from the same cache.
 #
 # Usage:
 #   bash train_eval/run_drgrpo_plus_training_v6_waymo_ver2_train.sh
@@ -16,7 +18,6 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$SCRIPT_DIR/_val_scene_tokens.sh"
 
 export NAVSIM_DEVKIT_ROOT=/home/byounggun/DiffusionDrive
 export NAVSIM_EXP_ROOT=/data/navsim/exp/bg
@@ -27,11 +28,10 @@ export PYTHONPATH="$NAVSIM_DEVKIT_ROOT:${PYTHONPATH:-}"
 
 ASSIGNMENT_JSON="${ASSIGNMENT_JSON:-/home/byounggun/DiffusionDrive/assignments_navsim_all-splits_keep_all-queue_all-scope_all-labelers_2026-05-26T1239.json}"
 
-VAL_TOKEN_OUTPUT="$(all_val_scene_tokens_and_count)"
-VAL_SCENE_COUNT="${VAL_TOKEN_OUTPUT%% *}"
-VAL_SCENE_TOKENS="${VAL_TOKEN_OUTPUT#* }"
-
-echo "Using full val-split scene tokens (count: $VAL_SCENE_COUNT)"
+# Default: no scene_filter.tokens override -> use the full navtrain token list
+# from navtrain.yaml. Assignment / assign+random wrappers append their own
+# ++train_test_split.scene_filter.tokens=... via "$@", which wins over the default.
+echo "Using full navtrain scene_filter (cached scenes only after metric-cache intersection)"
 
 DEFAULT_V6_WAYMO_DIR="/data2/byounggun/diffusiondrive_ar_output/step_corner_v2048_joint_v6_waymo/checkpoints"
 if [ -z "${BASE_CKPT:-}" ]; then
@@ -60,8 +60,8 @@ MAX_EPOCHS="${MAX_EPOCHS:-25}"
 DEVICES="${DEVICES:-1}"
 ACCUMULATE_GRAD_BATCHES="${ACCUMULATE_GRAD_BATCHES:-8}"
 KEEP_LAST_N="${KEEP_LAST_N:-9999}"
-METRIC_CACHE_PATH="${METRIC_CACHE_PATH:-/data2/byounggun/metric_cache_val}"
-OUTPUT_DIR="${OUTPUT_DIR:-/data2/byounggun/diffusiondrive_drgrpo_plus_output_v6_waymo_epoch120_ver2_val_full}"
+METRIC_CACHE_PATH="${METRIC_CACHE_PATH:-/data2/byounggun/metric_cache_train_merged}"
+OUTPUT_DIR="${OUTPUT_DIR:-/data2/byounggun/diffusiondrive_drgrpo_plus_output_v6_waymo_epoch120_ver2_train_full}"
 
 # Simple resume support (auto-continue if last.ckpt exists)
 RESUME_CKPT="${RESUME_CKPT-__auto__}"
@@ -91,7 +91,7 @@ fi
 EFFECTIVE_BATCH=$(( DEVICES * ACCUMULATE_GRAD_BATCHES * GROUP_SIZE ))
 
 echo "=================================================="
-echo "DiffusionDrive-AR Dr. GRPO+ v2 (Aggressive) - v6_waymo epoch-120 VAL"
+echo "DiffusionDrive-AR Dr. GRPO+ v2 (Aggressive) - v6_waymo epoch-120 TRAIN (full navtrain, cached)"
 echo "=================================================="
 echo "Algorithm    : dr_grpo_plus (v2 aggressive)"
 echo "Base ckpt    : $BASE_CKPT"
@@ -109,13 +109,12 @@ cd "$NAVSIM_DEVKIT_ROOT"
 python3 -m navsim.agents.diffusiondrive.grpo_train \
     train_test_split=navtrain \
     ++train_test_split.scene_filter.log_names=null \
-    "++train_test_split.scene_filter.tokens=$VAL_SCENE_TOKENS" \
     ++checkpoint_path="$SAFE_CKPT" \
     ++metric_cache_path="$METRIC_CACHE_PATH" \
     navsim_log_path="$OPENSCENE_DATA_ROOT/navsim_logs/trainval" \
     sensor_blobs_path="$OPENSCENE_DATA_ROOT/sensor_blobs/trainval" \
     output_dir="$OUTPUT_DIR" \
-    ++experiment_name=diffusiondrive_ar_drgrpo_plus_v6_waymo_epoch120_ver2_val_full \
+    ++experiment_name=diffusiondrive_ar_drgrpo_plus_v6_waymo_epoch120_ver2_train_full \
     ++config.ego_vocab_size=2048 \
     ++config.ego_vocab_path=/home/byounggun/DiffusionDrive/codebook_cache/waymo_kdisk_v2048_diffusiondrive/ego.npy \
     ++config.ar_codebook_mode=step_corners \
@@ -143,9 +142,9 @@ python3 -m navsim.agents.diffusiondrive.grpo_train \
     "${RESUME_ARGS[@]}" \
     wandb.enabled=true \
     wandb.project="diffusiondrive-grpo" \
-    wandb.name="drgrpo_plus_v6_waymo_ep120_ver2_val_full_g${GROUP_SIZE}_lr${LR}_clip${CLIP_EPS}_acc${ACCUMULATE_GRAD_BATCHES}" \
+    wandb.name="drgrpo_plus_v6_waymo_ep120_ver2_train_full_g${GROUP_SIZE}_lr${LR}_clip${CLIP_EPS}_acc${ACCUMULATE_GRAD_BATCHES}" \
     "$@"
 
 echo "=================================================="
-echo "Dr. GRPO+ v2 VAL (full) Training Complete! Output: $OUTPUT_DIR"
+echo "Dr. GRPO+ v2 TRAIN (full navtrain, cached) Training Complete! Output: $OUTPUT_DIR"
 echo "=================================================="
