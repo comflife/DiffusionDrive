@@ -10,10 +10,139 @@ from typing import Dict, List, Optional
 import lzma
 import pickle
 
-from navsim.common.dataclasses import SceneFilter
+from navsim.common.dataclasses import SceneFilter, SensorConfig
 from navsim.common.dataloader import SceneLoader, MetricCacheLoader
 from navsim.planning.metric_caching.metric_cache import MetricCache
 from navsim.agents.diffusiondrive.transfuser_features import TransfuserFeatureBuilder, TransfuserTargetBuilder
+
+
+def _frame_has_sensor_blobs(
+    scene_dict_list: List[Dict],
+    sensor_blobs_path: Path,
+    num_history_frames: int,
+    sensor_config: SensorConfig,
+) -> bool:
+    """Return True if all sensor blobs required by sensor_config exist on disk."""
+    for frame_idx in range(num_history_frames):
+        sensor_names = sensor_config.get_sensors_at_iteration(frame_idx)
+        frame = scene_dict_list[frame_idx]
+        for camera_name, camera_spec in frame["cams"].items():
+            if camera_name.lower() in sensor_names:
+                image_path = sensor_blobs_path / camera_spec["data_path"]
+                if not image_path.is_file():
+                    return False
+        if "lidar_pc" in sensor_names:
+            lidar_path = sensor_blobs_path / frame["lidar_path"]
+            if not lidar_path.is_file():
+                return False
+    return True
+
+
+def _pick_loadable_frame_token(
+    scene_loader: SceneLoader,
+    candidates: List[str],
+) -> Optional[str]:
+    """Pick the first cache-backed frame token whose sensor blobs exist."""
+    num_history = scene_loader._scene_filter.num_history_frames
+    sensor_blobs_path = scene_loader._sensor_blobs_path
+    sensor_config = scene_loader._sensor_config
+
+    for frame_token in sorted(candidates):
+        scene_dict_list = scene_loader.scene_frames_dicts[frame_token]
+        if _frame_has_sensor_blobs(
+            scene_dict_list,
+            sensor_blobs_path,
+            num_history,
+            sensor_config,
+        ):
+            return frame_token
+    return None
+
+
+def _pick_fallback_frame_token(candidates: List[str]) -> Optional[str]:
+    """Pick a canonical cache-backed frame when no sensor blobs are on disk."""
+    if not candidates:
+        return None
+    sorted_candidates = sorted(candidates)
+    return sorted_candidates[len(sorted_candidates) // 2]
+
+
+def _resolve_training_tokens(
+    scene_loader: SceneLoader,
+    metric_cache_loader: MetricCacheLoader,
+    tokens: Optional[List[str]] = None,
+) -> List[str]:
+    """Map requested scene/frame tokens to cache-backed frame tokens.
+
+    Assignment exports use ``scene_token``, while SceneLoader / metric cache
+    keys use the anchor frame ``token``. Prefer sliding-window frames whose
+    sensor blobs exist; otherwise fall back to a cache-backed frame so RL can
+    still run (samples without blobs are skipped lazily in ``__getitem__``).
+    """
+    scene_token_keys = set(scene_loader.tokens)
+    cache_token_keys = set(metric_cache_loader.tokens)
+    available = scene_token_keys & cache_token_keys
+    if tokens is None:
+        resolved = []
+        with_sensors = 0
+        for frame_token in sorted(available):
+            picked = _pick_loadable_frame_token(scene_loader, [frame_token])
+            if picked is None:
+                picked = frame_token
+            else:
+                with_sensors += 1
+            resolved.append(picked)
+        if resolved and with_sensors < len(resolved):
+            print(
+                f"Token resolution: {with_sensors}/{len(resolved)} cache tokens "
+                f"have verified sensor blobs under {scene_loader._sensor_blobs_path}"
+            )
+        return resolved
+
+    num_history = scene_loader._scene_filter.num_history_frames
+    by_scene_token: Dict[str, List[str]] = {}
+    for frame_token in available:
+        frame_list = scene_loader.scene_frames_dicts[frame_token]
+        anchor = frame_list[num_history - 1]
+        scene_token = anchor.get("scene_token")
+        if scene_token:
+            by_scene_token.setdefault(scene_token, []).append(frame_token)
+
+    resolved: List[str] = []
+    seen: set = set()
+    with_sensors = 0
+    fallback_without_sensors = 0
+    skipped_unresolved = 0
+    for requested in tokens:
+        candidates: List[str] = []
+        if requested in available:
+            candidates = [requested]
+        elif requested in by_scene_token:
+            candidates = by_scene_token[requested]
+
+        frame_token = _pick_loadable_frame_token(scene_loader, candidates)
+        if frame_token is not None:
+            with_sensors += 1
+        elif candidates:
+            frame_token = _pick_fallback_frame_token(candidates)
+            fallback_without_sensors += 1
+        else:
+            skipped_unresolved += 1
+            continue
+
+        if frame_token not in seen:
+            resolved.append(frame_token)
+            seen.add(frame_token)
+
+    if fallback_without_sensors or skipped_unresolved:
+        print(
+            f"Token resolution: {with_sensors} with verified sensors, "
+            f"{fallback_without_sensors} cache-only fallback "
+            f"(missing blobs under {scene_loader._sensor_blobs_path}), "
+            f"{skipped_unresolved} not in scene/cache intersection"
+        )
+
+    return resolved
 
 
 class GRPOEpisodeDataset(Dataset):
@@ -44,28 +173,30 @@ class GRPOEpisodeDataset(Dataset):
         cache_tokens = set(metric_cache_loader.tokens)
         print(f"SceneLoader: {len(scene_tokens)} tokens")
         print(f"MetricCacheLoader: {len(cache_tokens)} tokens")
-        
-        # Filter tokens that exist in both
+
         if tokens is None:
-            self.tokens = list(scene_tokens & cache_tokens)
+            self.tokens = _resolve_training_tokens(scene_loader, metric_cache_loader, None)
         else:
-            requested_tokens = set(tokens)
-            self.tokens = list(requested_tokens & scene_tokens & cache_tokens)
-            print(f"Requested: {len(requested_tokens)} tokens")
-        
-        print(f"GRPO Dataset: {len(self.tokens)} valid tokens (intersection)")
-        
-        # Show some examples of missing tokens
+            print(f"Requested: {len(tokens)} tokens")
+            self.tokens = _resolve_training_tokens(scene_loader, metric_cache_loader, list(tokens))
+
+        print(f"GRPO Dataset: {len(self.tokens)} valid tokens (resolved)")
         if len(self.tokens) == 0:
             if len(scene_tokens) > 0:
-                print(f"Sample scene tokens: {list(scene_tokens)[:5]}")
+                print(f"Sample scene loader tokens: {list(scene_tokens)[:5]}")
             if len(cache_tokens) > 0:
                 print(f"Sample cache tokens: {list(cache_tokens)[:5]}")
             if tokens is not None and len(tokens) > 0:
                 sample_token = tokens[0]
                 print(f"Sample requested token: {sample_token}")
-                print(f"  In scene_loader: {sample_token in scene_tokens}")
-                print(f"  In cache_loader: {sample_token in cache_tokens}")
+                print(
+                    f"  Direct frame-token match: "
+                    f"{sample_token in scene_tokens and sample_token in cache_tokens}"
+                )
+            raise ValueError(
+                "GRPO dataset is empty after token resolution. "
+                "Check metric cache coverage, scene_filter.tokens, and sensor/log paths."
+            )
         
     def __len__(self):
         return len(self.tokens)
@@ -76,9 +207,8 @@ class GRPOEpisodeDataset(Dataset):
         # Get agent input
         try:
             agent_input = self.scene_loader.get_agent_input_from_token(token)
-        except FileNotFoundError as e:
-            print(f"Warning: Missing sensor data for token {token}: {e}")
-            # Return a different sample
+        except FileNotFoundError:
+            # Should be rare after init-time sensor filtering.
             return self.__getitem__((idx + 1) % len(self.tokens))
         
         # Build features (use compute_features, not build)
@@ -130,16 +260,25 @@ class GRPODataModule(pl.LightningDataModule):
         print(f"DEBUG: scene_filter_cfg: {scene_filter_cfg}")
         
         scene_filter: SceneFilter = instantiate(self.train_test_split.scene_filter)
-        
-        # Filter log_names based on train_logs if available
+
+        tokens = self.train_test_split.get('scene_filter', {}).get('tokens', None)
+        if tokens is not None:
+            tokens = list(tokens)
+
+        # Restrict logs to the train/val split. When an explicit token list is
+        # provided (assignment / official val scenes), keep val logs too.
         train_logs = getattr(self.train_test_split, 'train_logs', None)
+        val_logs = getattr(self.train_test_split, 'val_logs', None)
         if train_logs is not None:
+            allowed_logs = set(train_logs)
+            if tokens is not None and val_logs is not None:
+                allowed_logs |= set(val_logs)
             if scene_filter.log_names is not None:
                 scene_filter.log_names = [
-                    log_name for log_name in scene_filter.log_names if log_name in train_logs
+                    log_name for log_name in scene_filter.log_names if log_name in allowed_logs
                 ]
             else:
-                scene_filter.log_names = train_logs
+                scene_filter.log_names = sorted(allowed_logs)
         
         print(f"Scene filter: {len(scene_filter.log_names) if scene_filter.log_names else 'all'} logs")
         
@@ -159,11 +298,6 @@ class GRPODataModule(pl.LightningDataModule):
         
         # Metric cache loader
         metric_cache_loader = MetricCacheLoader(Path(self.hparams.metric_cache_path))
-        
-        # Pass scene_filter.tokens so the dataset filters to the requested scenes
-        tokens = self.train_test_split.get('scene_filter', {}).get('tokens', None)
-        if tokens is not None:
-            tokens = list(tokens)
         
         # Create dataset
         self.dataset = GRPOEpisodeDataset(

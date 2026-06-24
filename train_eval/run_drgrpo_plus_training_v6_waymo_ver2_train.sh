@@ -7,10 +7,11 @@
 # Usage:
 #   bash train_eval/run_drgrpo_plus_training_v6_waymo_ver2_train.sh
 #   DEVICES=1 bash train_eval/run_drgrpo_plus_training_v6_waymo_ver2_train.sh
-#   Run three val experiments in parallel (one GPU each):
+#   Run four experiments in parallel (one GPU each):
 #     CUDA_VISIBLE_DEVICES=0 bash train_eval/run_drgrpo_plus_training_v6_waymo_ver2_train.sh
 #     CUDA_VISIBLE_DEVICES=1 bash train_eval/run_drgrpo_plus_training_v6_waymo_ver2_train_assignments.sh
-#     CUDA_VISIBLE_DEVICES=2 bash train_eval/run_drgrpo_plus_training_v6_waymo_ver2_train_random_scenes.sh
+#     CUDA_VISIBLE_DEVICES=2 bash train_eval/run_drgrpo_plus_training_v6_waymo_ver2_train_assign_plus_random_scenes.sh
+#     CUDA_VISIBLE_DEVICES=3 bash train_eval/run_drgrpo_plus_training_v6_waymo_ver2_test_assign_plus_random_scenes.sh
 
 set -euo pipefail
 
