@@ -182,102 +182,43 @@ The exact CLI varies between scripts — read the `argparse` block at the top of
 
 ## Training
 
-All training scripts live under [train_eval/](train_eval/). Run them from the repo root:
+All scripts live under [train_eval/](train_eval/). Edit the path/env vars in a script first, then run it from the repo root:
 
 ```bash
-cd DiffusionDrive
 bash train_eval/<script>.sh
 ```
 
-Edit the script first to point `NAVSIM_EXP_ROOT`, `OPENSCENE_DATA_ROOT`, `cache_path`, and `output_dir` at your storage.
+### SFT (V=2048, step_corners) — current main recipe
 
-### Frozen-trunk SFT (V=512, step_delta)
+[train_eval/ardecoder_train.sh](train_eval/ardecoder_train.sh) jointly fine-tunes the trunk and trains the AR head from the pretrained `diffusiondrive_navsim_88p1_PDMS` checkpoint.
 
-[train_eval/run_training_ar_v512_full_v2_frozen.sh](train_eval/run_training_ar_v512_full_v2_frozen.sh) — minimal config: trunk is frozen, only the AR head trains.
+- `freeze_pretrained_trunk=false` (joint), uniform `lr=2e-4`
+- `ego_vocab_size=2048`, `ar_codebook_mode=step_corners`, waymo codebook
+- residual delta + heading head + step-aware agent + ego cross-attn + deformable BEV + BEV pos enc, `agent_topk=30`
+- 150 epochs, milestone checkpoint every 10 epochs from epoch 80
 
-Key overrides:
-
-- `agent.config.freeze_pretrained_trunk=true`
-- `agent.config.ego_vocab_size=512`
-- `agent.config.ar_codebook_mode=step_delta`
-
-### Joint-trunk SFT (V=2048, step_corners) — recommended
-
-[train_eval/run_training_ar_step_corner_v2048_joint_v2.sh](train_eval/run_training_ar_step_corner_v2048_joint_v2.sh) — current main recipe.
-
-Key overrides:
-
-- `agent.config.freeze_pretrained_trunk=false`
-- `agent.config.trunk_lr_mult=0.05` → trunk gets `lr × 0.05` while the AR head keeps full lr
-- `agent.config.ego_vocab_size=2048`
-- `agent.config.ar_codebook_mode=step_corners`
-- `agent.config.ar_use_residual_delta=true`, `ar_use_heading_head=false` (heading comes from the discrete token's `dθ`)
-- `agent.config.ar_step_aware_agent=true`
-- `agent.config.ar_use_ego_cross_attn=true`
-- `agent.config.ar_use_deformable_bev=true`
-
-In joint mode the auxiliary `agent_class_loss`, `agent_box_loss`, and `bev_semantic_loss` are added automatically — see the **Loss** section.
-
-### Other available recipes
-
-[train_eval/](train_eval/) contains a handful of related ablations:
-
-- `run_training_ar_v512_full_v2.sh` — V=512 step_delta, joint trunk
-- `run_training_ar_step_corner_v2048_full.sh` — V=2048 step_corners with default heading head
-- `run_training_ar_step_corner_v2048_heading_stepagent.sh` — heading head + step-aware agent
-- `run_training_ar_step_corner_v2048_heading_stepagent_notf.sh` — same but with `teacher_forcing=false`
-- `run_training_ar_step_corner_v2048_scratch.sh` — train from scratch (no pretrained trunk)
+In joint mode the auxiliary `agent_class_loss`, `agent_box_loss`, and `bev_semantic_loss` are added automatically (see **Loss**).
 
 ## Evaluation
 
-Eval scripts mirror the training recipes and live in the same folder:
-
-- [train_eval/run_eval_ar_v512_full_v2_frozen_latest.sh](train_eval/run_eval_ar_v512_full_v2_frozen_latest.sh)
-- [train_eval/run_eval_ar_v512_full_v2_latest.sh](train_eval/run_eval_ar_v512_full_v2_latest.sh)
-- [train_eval/run_eval_ar_step_corner_v2048_full_latest.sh](train_eval/run_eval_ar_step_corner_v2048_full_latest.sh)
-- [train_eval/run_eval_ar_step_corner_v2048_heading_stepagent_latest.sh](train_eval/run_eval_ar_step_corner_v2048_heading_stepagent_latest.sh)
-- [train_eval/run_eval_ar_step_corner_v2048_heading_stepagent_notf_latest.sh](train_eval/run_eval_ar_step_corner_v2048_heading_stepagent_notf_latest.sh)
-
-Edit the `agent.checkpoint_path` line in the script to point at your `last.ckpt`, then:
-
-```bash
-bash train_eval/run_eval_ar_step_corner_v2048_full_latest.sh
-```
+[train_eval/ardecoder_eval.sh](train_eval/ardecoder_eval.sh) evaluates milestone checkpoints on `navtest` and writes PDMS into a summary CSV. Set `CKPT_DIR`, `START_EPOCH`, `END_EPOCH` to match your training run. The same harness evaluates GRPO checkpoints — point `CKPT_DIR` at the GRPO output and keep the `agent.config.ar_*` overrides matching the checkpoint.
 
 ## GRPO Fine-Tuning
 
-After SFT, the AR model can be further tuned with GRPO using PDMS as the reward.
+After SFT, the AR model can be tuned with RL using PDM Score (PDMS) as the sequence-level reward. The trainer ([navsim/agents/diffusiondrive/grpo_trainer.py](navsim/agents/diffusiondrive/grpo_trainer.py)) keeps a trainable policy and a frozen reference, samples `G` AR rollouts per scene, scores them with PDMS, and optimizes a PPO-clipped policy-gradient loss with optional KL.
+
+Supported algorithms (`++algorithm=<name>`): `grpo`, `dr_grpo`, `gspo`, `dr_gspo`, `gspo_token`, `grpo_plus`, `dr_grpo_plus` — current default is `dr_grpo_plus` (NoRD recipe on GRPO+ with per-token attention weighting from rollout divergence).
 
 ### Training
 
-- [train_eval/run_grpo_training.sh](train_eval/run_grpo_training.sh)
-- [train_eval/run_grpo_training_base_t08.sh](train_eval/run_grpo_training_base_t08.sh)
+- [train_eval/drgrpoplus_val_train.sh](train_eval/drgrpoplus_val_train.sh) — Dr. GRPO+ on the navtrain VAL split
+- [train_eval/drgrpoplus_val_assign_train.sh](train_eval/drgrpoplus_val_assign_train.sh) — same, restricted to loadable val-split assignment scenes
 
-Default GRPO setup (in `run_grpo_training_base_t08.sh`):
-
-- train split for rollouts: `navtest`
-- reward: PDMS
-- group size: `16`
-- sampling temperature: `0.8`
-- KL coefficient: `0.1`
-- PPO clip epsilon: `0.2`
-- learning rate: `1e-6`
-
-Implementation notes:
-
-- rollouts are AR sampling, not teacher forcing
-- the loss recomputes log-probs in **teacher-forced** mode on the rollout tokens (`V2TransfuserModelAR.compute_token_log_probs`) so that `log π_θ(a_t | s, a_{<t})` conditions on the rollout — not the model's own AR predictions
-- reward is sequence-level PDMS
-- KL is computed against a frozen reference model
+Default setup: base = `v6_waymo` SFT `milestone_epoch_120.ckpt`, group size 12, temperature 1.0, KL 0.0, clip 0.25, lr 1e-5, 35 epochs. AR config matches the SFT base. Override via env vars (`GROUP_SIZE`, `LR`, `MAX_EPOCHS`, `DEVICES`, ...); auto-resumes from `last.ckpt` unless `RESUME_CKPT=none`.
 
 ### Evaluation
 
-- [train_eval/run_eval_grpo_base_t08.sh](train_eval/run_eval_grpo_base_t08.sh)
-- [train_eval/run_eval_grpo_latest.sh](train_eval/run_eval_grpo_latest.sh)
-- [train_eval/run_eval_grpo_epoch0.sh](train_eval/run_eval_grpo_epoch0.sh)
-- [train_eval/run_eval_grpo_converted.sh](train_eval/run_eval_grpo_converted.sh)
-
-Edit the script's `agent.checkpoint_path` to your GRPO `last.ckpt`, then run.
+GRPO checkpoints are standard AR checkpoints — evaluate them with [train_eval/ardecoder_eval.sh](train_eval/ardecoder_eval.sh) (see **Evaluation** above), keeping the `agent.config.ar_*` overrides matching the SFT base.
 
 ## Main Files
 
