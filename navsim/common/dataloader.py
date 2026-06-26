@@ -162,12 +162,18 @@ class MetricCacheLoader:
     def __init__(self, cache_path: Path, file_name: str = "metric_cache.pkl"):
         """
         Initializes the metric cache loader.
-        :param cache_path: directory of cache folder
+        :param cache_path: directory of cache folder. Multiple folders may be
+            passed as a single comma-separated string (later folders win on
+            token collisions), enabling a merged view over several caches.
         :param file_name: file name of cached files, defaults to "metric_cache.pkl"
         """
 
         self._file_name = file_name
-        self.metric_cache_paths = self._load_metric_cache_paths(cache_path)
+        raw_paths = [p.strip() for p in str(cache_path).split(",") if p.strip()]
+        merged: Dict[str, Path] = {}
+        for raw_path in raw_paths:
+            merged.update(self._load_metric_cache_paths(Path(raw_path)))
+        self.metric_cache_paths = merged
 
     def _load_metric_cache_paths(self, cache_path: Path) -> Dict[str, Path]:
         """

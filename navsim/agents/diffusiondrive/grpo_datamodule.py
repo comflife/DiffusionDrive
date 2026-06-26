@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Dict, List, Optional
 import lzma
 import pickle
+import json
+from omegaconf import OmegaConf
 
 from navsim.common.dataclasses import SceneFilter, SensorConfig
 from navsim.common.dataloader import SceneLoader, MetricCacheLoader
@@ -145,6 +147,20 @@ def _resolve_training_tokens(
     return resolved
 
 
+def _token_has_sensor_blobs(scene_loader: SceneLoader, token: str) -> bool:
+    scene_dict_list = scene_loader.scene_frames_dicts[token]
+    return _frame_has_sensor_blobs(
+        scene_dict_list,
+        scene_loader._sensor_blobs_path,
+        scene_loader._scene_filter.num_history_frames,
+        scene_loader._sensor_config,
+    )
+
+
+def _filter_loadable_tokens(scene_loader: SceneLoader, tokens: List[str]) -> List[str]:
+    return [token for token in tokens if _token_has_sensor_blobs(scene_loader, token)]
+
+
 class GRPOEpisodeDataset(Dataset):
     """
     Dataset for GRPO episodes.
@@ -175,12 +191,22 @@ class GRPOEpisodeDataset(Dataset):
         print(f"MetricCacheLoader: {len(cache_tokens)} tokens")
 
         if tokens is None:
-            self.tokens = _resolve_training_tokens(scene_loader, metric_cache_loader, None)
+            resolved = _resolve_training_tokens(scene_loader, metric_cache_loader, None)
         else:
             print(f"Requested: {len(tokens)} tokens")
-            self.tokens = _resolve_training_tokens(scene_loader, metric_cache_loader, list(tokens))
+            resolved = _resolve_training_tokens(scene_loader, metric_cache_loader, list(tokens))
 
-        print(f"GRPO Dataset: {len(self.tokens)} valid tokens (resolved)")
+        # Keep only tokens whose sensor blobs exist on disk so __getitem__ never
+        # has to skip/recurse at training time (trainval blobs are incomplete).
+        self.tokens = _filter_loadable_tokens(scene_loader, resolved)
+        dropped = len(resolved) - len(self.tokens)
+        if dropped:
+            print(
+                f"Dropped {dropped} resolved tokens without sensor blobs under "
+                f"{scene_loader._sensor_blobs_path}"
+            )
+
+        print(f"GRPO Dataset: {len(self.tokens)} valid tokens (loadable)")
         if len(self.tokens) == 0:
             if len(scene_tokens) > 0:
                 print(f"Sample scene loader tokens: {list(scene_tokens)[:5]}")
@@ -194,7 +220,7 @@ class GRPOEpisodeDataset(Dataset):
                     f"{sample_token in scene_tokens and sample_token in cache_tokens}"
                 )
             raise ValueError(
-                "GRPO dataset is empty after token resolution. "
+                "GRPO dataset is empty: no resolved tokens have loadable sensor blobs. "
                 "Check metric cache coverage, scene_filter.tokens, and sensor/log paths."
             )
         
@@ -202,30 +228,36 @@ class GRPOEpisodeDataset(Dataset):
         return len(self.tokens)
     
     def __getitem__(self, idx):
-        token = self.tokens[idx]
-        
-        # Get agent input
-        try:
-            agent_input = self.scene_loader.get_agent_input_from_token(token)
-        except FileNotFoundError:
-            # Should be rare after init-time sensor filtering.
-            return self.__getitem__((idx + 1) % len(self.tokens))
-        
-        # Build features (use compute_features, not build)
-        features = {}
-        for builder in self.feature_builders:
-            features.update(builder.compute_features(agent_input))
-        
-        # Build targets (need scene for targets)
-        # Load scene for target computation
-        scene = self.scene_loader.get_scene_from_token(token)
-        targets = {}
-        for builder in self.target_builders:
-            targets.update(builder.compute_targets(scene))
-        
-        # Return token instead of metric_cache (will be loaded lazily in trainer)
-        # This avoids pickle issues with DataLoader
-        return features, targets, token
+        num_tokens = len(self.tokens)
+        last_error = None
+
+        # Bounded scan (no recursion): tokens are pre-filtered to ones with
+        # sensor blobs, but stay defensive against transient read errors.
+        for attempt in range(num_tokens):
+            token = self.tokens[(idx + attempt) % num_tokens]
+            try:
+                agent_input = self.scene_loader.get_agent_input_from_token(token)
+            except (FileNotFoundError, OSError) as exc:
+                last_error = exc
+                continue
+
+            features = {}
+            for builder in self.feature_builders:
+                features.update(builder.compute_features(agent_input))
+
+            scene = self.scene_loader.get_scene_from_token(token)
+            targets = {}
+            for builder in self.target_builders:
+                targets.update(builder.compute_targets(scene))
+
+            # Return token instead of metric_cache (loaded lazily in trainer);
+            # this avoids pickle issues with the DataLoader workers.
+            return features, targets, token
+
+        raise RuntimeError(
+            f"No loadable sample among {num_tokens} tokens (start idx={idx}). "
+            f"Last error: {last_error!r}"
+        )
 
 
 class GRPODataModule(pl.LightningDataModule):
@@ -255,15 +287,29 @@ class GRPODataModule(pl.LightningDataModule):
         print(f"DEBUG: train_test_split type: {type(self.train_test_split)}")
         print(f"DEBUG: train_test_split keys: {list(self.train_test_split.keys()) if hasattr(self.train_test_split, 'keys') else 'N/A'}")
         
-        # Build scene filter (similar to run_training.py)
+        # Build scene filter (similar to run_training.py). Large token lists can
+        # be passed via scene_filter.tokens_file to avoid shell argument limits.
         scene_filter_cfg = self.train_test_split.get('scene_filter', None)
         print(f"DEBUG: scene_filter_cfg: {scene_filter_cfg}")
-        
-        scene_filter: SceneFilter = instantiate(self.train_test_split.scene_filter)
 
         tokens = self.train_test_split.get('scene_filter', {}).get('tokens', None)
+        tokens_file = self.train_test_split.get('scene_filter', {}).get('tokens_file', None)
+        if tokens is None and tokens_file:
+            with open(tokens_file, "r") as f:
+                payload = json.load(f)
+            tokens = payload["tokens"] if isinstance(payload, dict) else payload
         if tokens is not None:
             tokens = list(tokens)
+
+        scene_filter_cfg_for_instantiate = OmegaConf.create(
+            OmegaConf.to_container(self.train_test_split.scene_filter, resolve=True)
+        )
+        if "tokens_file" in scene_filter_cfg_for_instantiate:
+            del scene_filter_cfg_for_instantiate["tokens_file"]
+        if tokens is not None:
+            scene_filter_cfg_for_instantiate.tokens = tokens
+
+        scene_filter: SceneFilter = instantiate(scene_filter_cfg_for_instantiate)
 
         # Restrict logs to the train/val split. When an explicit token list is
         # provided (assignment / official val scenes), keep val logs too.
@@ -305,7 +351,12 @@ class GRPODataModule(pl.LightningDataModule):
             metric_cache_loader=metric_cache_loader,
             feature_builders=feature_builders,
             target_builders=target_builders,
-            tokens=tokens,
+            # scene_filter.tokens has already been applied by SceneLoader. Do
+            # not pass the scene_token list again here, or each scene_token is
+            # resolved to only one representative frame token. Leaving this as
+            # None preserves the old behavior: train on the full
+            # SceneLoader ∩ metric-cache frame-token intersection.
+            tokens=None,
         )
         
     def train_dataloader(self):

@@ -8,10 +8,11 @@ import lzma
 import pickle
 import os
 import uuid
+import json
 
 import hydra
 from hydra.utils import instantiate
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 import pandas as pd
 
 from nuplan.planning.script.builders.logging_builder import build_logger
@@ -30,6 +31,21 @@ logger = logging.getLogger(__name__)
 
 CONFIG_PATH = "config/pdm_scoring"
 CONFIG_NAME = "default_run_pdm_score"
+
+
+def _instantiate_scene_filter(cfg: DictConfig) -> SceneFilter:
+    """Instantiate SceneFilter, optionally loading a large token list from JSON."""
+    scene_filter_cfg = OmegaConf.create(
+        OmegaConf.to_container(cfg.train_test_split.scene_filter, resolve=True)
+    )
+    tokens_file = scene_filter_cfg.get("tokens_file", None)
+    if tokens_file and scene_filter_cfg.get("tokens", None) is None:
+        with open(tokens_file, "r") as f:
+            payload = json.load(f)
+        scene_filter_cfg.tokens = payload["tokens"] if isinstance(payload, dict) else payload
+    if "tokens_file" in scene_filter_cfg:
+        del scene_filter_cfg["tokens_file"]
+    return instantiate(scene_filter_cfg)
 
 
 def run_pdm_score(args: List[Dict[str, Union[List[str], DictConfig]]]) -> List[Dict[str, Any]]:
@@ -54,7 +70,7 @@ def run_pdm_score(args: List[Dict[str, Union[List[str], DictConfig]]]) -> List[D
     agent.initialize()
 
     metric_cache_loader = MetricCacheLoader(Path(cfg.metric_cache_path))
-    scene_filter: SceneFilter = instantiate(cfg.train_test_split.scene_filter)
+    scene_filter: SceneFilter = _instantiate_scene_filter(cfg)
     scene_filter.log_names = log_names
     scene_filter.tokens = tokens
     scene_loader = SceneLoader(
@@ -138,7 +154,7 @@ def main(cfg: DictConfig) -> None:
         scene_loader = SceneLoader(
             sensor_blobs_path=None,
             data_path=Path(cfg.navsim_log_path),
-            scene_filter=instantiate(cfg.train_test_split.scene_filter),
+            scene_filter=_instantiate_scene_filter(cfg),
             sensor_config=SensorConfig.build_no_sensors(),
         )
         tokens_to_evaluate = list(set(scene_loader.tokens) & set(metric_cache_loader.tokens))
