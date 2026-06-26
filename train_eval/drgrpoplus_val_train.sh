@@ -1,19 +1,23 @@
 #!/bin/bash
-# Dr. GRPO v2 (Aggressive) fine-tuning on v6_waymo epoch-120 SFT.
+# Dr. GRPO+ v2 (Aggressive) fine-tuning on v6_waymo epoch-120 SFT, full VAL split.
 #
-# Changes from v1 (NoRD conservative):
-#   - LR 5e-6 → 1e-5
-#   - GROUP_SIZE 8 → 12
-#   - CLIP_EPS 0.2 → 0.25
-#   - ACCUMULATE_GRAD_BATCHES 4 → 8  (effective batch ~96 trajectories)
-#   - MAX_EPOCHS 40 → 60
+# Trains on the official navtrain VAL scenes (~2,632) PLUS the loadable val-split
+# assignment scenes (132 of 455). Only 132 assignment scenes have a route
+# (roadblock_ids) and thus a PDM metric cache entry; the other 323 have empty
+# roadblock_ids and cannot be PDM-scored (navsim's navtrain/navtest filters drop
+# such scenes via has_route=true). All scenes resolve from a single cache,
+# metric_cache_val (metric_cache_val_assign is a strict subset of it).
 #
-# Usage:
-#   bash train_eval/run_drgrpo_training_v6_waymo_120_ver2.sh
-#   DEVICES=2 ACCUMULATE_GRAD_BATCHES=8 bash train_eval/run_drgrpo_training_v6_waymo_120_ver2.sh
-#   BASE_CKPT=/path/to/ckpt.ckpt bash train_eval/run_drgrpo_training_v6_waymo_120_ver2.sh
+# Usage (4 GPUs, default):
+#   CUDA_VISIBLE_DEVICES=0,1,2,3 bash train_eval/drgrpoplus_val_train.sh
+#   CUDA_VISIBLE_DEVICES=0,1,2,3 bash train_eval/drgrpoplus_val_assign_train.sh
+#   Override GPU count with DEVICES=N (e.g. DEVICES=1 for a single GPU).
 
 set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/_val_scene_tokens.sh"
+source "$SCRIPT_DIR/_val_assign_loadable_scene_tokens.sh"
 
 export NAVSIM_DEVKIT_ROOT=/home/byounggun/DiffusionDrive
 export NAVSIM_EXP_ROOT=/data/navsim/exp/bg
@@ -22,7 +26,33 @@ export NUPLAN_MAPS_ROOT=/data/navsim/dataset/maps
 export TMPDIR=/data2/byounggun/ray_tmp
 export PYTHONPATH="$NAVSIM_DEVKIT_ROOT:${PYTHONPATH:-}"
 
-# Pick a base checkpoint (same v6_waymo epoch 120)
+# Official navtrain VAL scene tokens (~2,632)
+VAL_TOKEN_OUTPUT="$(all_val_scene_tokens_and_count)"
+VAL_SCENE_COUNT="${VAL_TOKEN_OUTPUT%% *}"
+VAL_SCENE_TOKENS="${VAL_TOKEN_OUTPUT#* }"
+
+# Loadable val-split assignment scene tokens (132 of 455; route-having + cached)
+ASSIGN_TOKEN_OUTPUT="$(val_assign_loadable_scene_tokens_and_count)"
+ASSIGN_SCENE_COUNT="${ASSIGN_TOKEN_OUTPUT%% *}"
+ASSIGN_SCENE_TOKENS="${ASSIGN_TOKEN_OUTPUT#* }"
+
+# Merge official val + loadable val assignment scene tokens (drop overlap)
+FULL_TOKEN_OUTPUT="$(python3 - "$VAL_SCENE_TOKENS" "$ASSIGN_SCENE_TOKENS" <<'PY'
+import json, sys
+val = json.loads(sys.argv[1])
+assign = json.loads(sys.argv[2])
+val_set = set(val)
+merged = val + [t for t in assign if t not in val_set]
+print(f"{len(merged)} {json.dumps(merged, separators=(',', ':'))}")
+PY
+)"
+FULL_SCENE_COUNT="${FULL_TOKEN_OUTPUT%% *}"
+FULL_SCENE_TOKENS="${FULL_TOKEN_OUTPUT#* }"
+
+echo "Official val scenes      : $VAL_SCENE_COUNT"
+echo "Val assign scenes (load) : $ASSIGN_SCENE_COUNT (of 455; 323 dropped: no route)"
+echo "Full val scenes          : $FULL_SCENE_COUNT"
+
 DEFAULT_V6_WAYMO_DIR="/data2/byounggun/diffusiondrive_ar_output/step_corner_v2048_joint_v6_waymo/checkpoints"
 if [ -z "${BASE_CKPT:-}" ]; then
     BASE_CKPT="$DEFAULT_V6_WAYMO_DIR/milestone_epoch_120.ckpt"
@@ -37,7 +67,7 @@ if [ ! -f "$BASE_CKPT" ]; then
     exit 1
 fi
 
-SAFE_CKPT="/tmp/drgrpo_v6_waymo_epoch120_ver2_base_$(date +%s).ckpt"
+SAFE_CKPT="/tmp/drgrpo_plus_v6_waymo_epoch120_ver2_val_base_$(date +%s).ckpt"
 ln -sfn "$BASE_CKPT" "$SAFE_CKPT"
 
 # ── Aggressive v2 tunables ───────────────────────────────────────────────
@@ -46,13 +76,16 @@ KL_COEF="${KL_COEF:-0.0}"
 CLIP_EPS="${CLIP_EPS:-0.25}"
 LR="${LR:-1e-5}"
 TEMPERATURE="${TEMPERATURE:-1.0}"
-MAX_EPOCHS="${MAX_EPOCHS:-60}"
+MAX_EPOCHS="${MAX_EPOCHS:-35}"
 DEVICES="${DEVICES:-4}"
 ACCUMULATE_GRAD_BATCHES="${ACCUMULATE_GRAD_BATCHES:-8}"
-KEEP_LAST_N="${KEEP_LAST_N:-9999}"
-OUTPUT_DIR="${OUTPUT_DIR:-/data2/byounggun/diffusiondrive_drgrpo_output_v6_waymo_epoch120_ver2}"
+# Save full checkpoints only at these (1-indexed) epochs; last.ckpt is always kept for resume.
+SAVE_EPOCHS="${SAVE_EPOCHS:-[20,25,30,35]}"
+# Single val cache; it already contains the 132 loadable assignment scenes.
+METRIC_CACHE_PATH="${METRIC_CACHE_PATH:-/data2/byounggun/metric_cache_val}"
+OUTPUT_DIR="${OUTPUT_DIR:-/data2/byounggun/trained_model/drgrpoplus_val}"
 
-# Resume logic (same as v1)
+# Simple resume support (auto-continue if last.ckpt exists)
 RESUME_CKPT="${RESUME_CKPT-__auto__}"
 if [ "$RESUME_CKPT" = "__auto__" ]; then
     if [ -f "$OUTPUT_DIR/checkpoints/last.ckpt" ]; then
@@ -71,7 +104,7 @@ if [ -n "$RESUME_CKPT" ]; then
         echo "ERROR: RESUME_CKPT not found at: $RESUME_CKPT" >&2
         exit 1
     fi
-    RESUME_SAFE_CKPT="/tmp/drgrpo_v6_waymo_epoch120_ver2_resume_$(date +%s).ckpt"
+    RESUME_SAFE_CKPT="/tmp/drgrpo_plus_v6_waymo_epoch120_ver2_val_resume_$(date +%s).ckpt"
     ln -sfn "$RESUME_CKPT" "$RESUME_SAFE_CKPT"
     RESUME_ARGS=(++resume_ckpt_path="$RESUME_SAFE_CKPT")
     RESUME_DISPLAY="$RESUME_CKPT"
@@ -80,29 +113,33 @@ fi
 EFFECTIVE_BATCH=$(( DEVICES * ACCUMULATE_GRAD_BATCHES * GROUP_SIZE ))
 
 echo "=================================================="
-echo "DiffusionDrive-AR Dr. GRPO v2 (Aggressive) - v6_waymo epoch-120"
+echo "DiffusionDrive-AR Dr. GRPO+ v2 (Aggressive) - v6_waymo epoch-120 VAL (full)"
 echo "=================================================="
-echo "Algorithm    : dr_grpo (v2 aggressive)"
+echo "Algorithm    : dr_grpo_plus (v2 aggressive)"
 echo "Base ckpt    : $BASE_CKPT"
 echo "Group size   : $GROUP_SIZE"
 echo "LR           : $LR"
 echo "Clip eps     : $CLIP_EPS"
 echo "Accum grads  : $ACCUMULATE_GRAD_BATCHES"
-echo "Eff. batch   : $EFFECTIVE_BATCH trajectories / opt step"
+echo "Eff. batch   : $EFFECTIVE_BATCH"
 echo "Max epochs   : $MAX_EPOCHS"
+echo "Save epochs  : $SAVE_EPOCHS (+ last.ckpt)"
+echo "Metric cache : $METRIC_CACHE_PATH"
 echo "Output       : $OUTPUT_DIR"
 echo "=================================================="
 
 cd "$NAVSIM_DEVKIT_ROOT"
 
 python3 -m navsim.agents.diffusiondrive.grpo_train \
-    train_test_split=navtest \
+    train_test_split=navtrain \
+    ++train_test_split.scene_filter.log_names=null \
+    "++train_test_split.scene_filter.tokens=$FULL_SCENE_TOKENS" \
     ++checkpoint_path="$SAFE_CKPT" \
-    ++metric_cache_path=/data2/byounggun/metric_cache \
-    navsim_log_path="$OPENSCENE_DATA_ROOT/navsim_logs/test" \
-    sensor_blobs_path="$OPENSCENE_DATA_ROOT/sensor_blobs/test" \
+    ++metric_cache_path="$METRIC_CACHE_PATH" \
+    navsim_log_path="$OPENSCENE_DATA_ROOT/navsim_logs/trainval" \
+    sensor_blobs_path="$OPENSCENE_DATA_ROOT/sensor_blobs/trainval" \
     output_dir="$OUTPUT_DIR" \
-    ++experiment_name=diffusiondrive_ar_drgrpo_v6_waymo_epoch120_ver2 \
+    ++experiment_name=diffusiondrive_ar_drgrpo_plus_v6_waymo_epoch120_ver2_val_full \
     ++config.ego_vocab_size=2048 \
     ++config.ego_vocab_path=/home/byounggun/DiffusionDrive/codebook_cache/waymo_kdisk_v2048_diffusiondrive/ego.npy \
     ++config.ar_codebook_mode=step_corners \
@@ -120,19 +157,19 @@ python3 -m navsim.agents.diffusiondrive.grpo_train \
     ++trainer.params.accumulate_grad_batches="$ACCUMULATE_GRAD_BATCHES" \
     ++batch_size=1 \
     ++num_workers=0 \
-    ++algorithm=dr_grpo \
+    ++algorithm=dr_grpo_plus \
     ++group_size="$GROUP_SIZE" \
     ++kl_coef="$KL_COEF" \
     ++clip_eps="$CLIP_EPS" \
     ++lr="$LR" \
     ++temperature="$TEMPERATURE" \
-    ++keep_last_n_ckpts="$KEEP_LAST_N" \
+    "++save_epochs=$SAVE_EPOCHS" \
     "${RESUME_ARGS[@]}" \
     wandb.enabled=true \
     wandb.project="diffusiondrive-grpo" \
-    wandb.name="drgrpo_v6_waymo_ep120_ver2_g${GROUP_SIZE}_lr${LR}_clip${CLIP_EPS}_acc${ACCUMULATE_GRAD_BATCHES}" \
+    wandb.name="drgrpo_plus_v6_waymo_ep120_ver2_val_full_g${GROUP_SIZE}_lr${LR}_clip${CLIP_EPS}_acc${ACCUMULATE_GRAD_BATCHES}" \
     "$@"
 
 echo "=================================================="
-echo "Dr. GRPO v2 Training Complete! Output: $OUTPUT_DIR"
+echo "Dr. GRPO+ v2 VAL (full) Training Complete! Output: $OUTPUT_DIR"
 echo "=================================================="

@@ -119,6 +119,8 @@ def main(cfg: DictConfig):
     keep_last_n         = int(cfg.get('keep_last_n_ckpts', 3))
     save_every_n_steps  = cfg.get('save_every_n_steps', None)
     save_every_n_steps  = int(save_every_n_steps) if save_every_n_steps else None
+    save_epochs_cfg     = cfg.get('save_epochs', None)
+    save_epochs         = sorted({int(e) for e in save_epochs_cfg}) if save_epochs_cfg else None
     ckpt_dir = Path(cfg.output_dir) / "checkpoints"
 
     class _KeepLastNCkpts(pl.callbacks.Callback):
@@ -152,6 +154,23 @@ def main(cfg: DictConfig):
             if self.every_n_steps is not None and (trainer.global_step + 1) % self.every_n_steps == 0:
                 self._prune(trainer)
 
+    class _MilestoneEpochCkpt(pl.callbacks.Callback):
+        """Save a full training checkpoint only at specific (1-indexed) epochs."""
+
+        def __init__(self, dirpath, epochs):
+            self.dirpath = Path(dirpath)
+            self.epochs = set(epochs)
+
+        def on_train_epoch_end(self, trainer, pl_module):
+            epoch_1 = trainer.current_epoch + 1
+            if epoch_1 in self.epochs:
+                if trainer.is_global_zero:
+                    self.dirpath.mkdir(parents=True, exist_ok=True)
+                path = self.dirpath / f"grpo-epoch={epoch_1:02d}.ckpt"
+                trainer.save_checkpoint(path)
+                if trainer.is_global_zero:
+                    print(f"[grpo_train] Saved milestone checkpoint: {path}")
+
     if save_every_n_steps is not None:
         # Step-based: PL's {step} placeholder auto-prepends "step=" itself,
         # so the template must NOT contain a literal `step=` (otherwise the
@@ -176,11 +195,27 @@ def main(cfg: DictConfig):
         )
         print(f"[grpo_train] Saving ckpt every epoch (keep latest {keep_last_n} + last.ckpt)")
 
-    callbacks = [
-        ckpt_cb,
-        _KeepLastNCkpts(ckpt_dir, keep_last_n, every_n_steps=save_every_n_steps),
-        pl.callbacks.LearningRateMonitor(logging_interval='step'),
-    ]
+    if save_epochs is not None:
+        # Milestone mode: only persist `last.ckpt` (for resume) via ModelCheckpoint,
+        # plus explicit full checkpoints at the requested epochs. Pruning is disabled
+        # so milestone files are never deleted.
+        ckpt_cb = pl.callbacks.ModelCheckpoint(
+            dirpath=ckpt_dir,
+            save_top_k=0,
+            save_last=True,
+        )
+        callbacks = [
+            ckpt_cb,
+            _MilestoneEpochCkpt(ckpt_dir, save_epochs),
+            pl.callbacks.LearningRateMonitor(logging_interval='step'),
+        ]
+        print(f"[grpo_train] Saving milestone ckpts at epochs {save_epochs} (+ last.ckpt)")
+    else:
+        callbacks = [
+            ckpt_cb,
+            _KeepLastNCkpts(ckpt_dir, keep_last_n, every_n_steps=save_every_n_steps),
+            pl.callbacks.LearningRateMonitor(logging_interval='step'),
+        ]
 
     # Setup wandb logger if enabled
     loggers = []
